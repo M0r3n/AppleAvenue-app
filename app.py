@@ -114,7 +114,6 @@ def load_data_integrated():
         content_rows = raw_data[start_idx:] if len(raw_data) > start_idx else []
 
         df = pd.DataFrame(content_rows, columns=final_headers)
-        # Индексация для Google Sheets (строки начинаются с 1)
         df["_sheet_row"] = range(START_WORKING_ROW + 1, START_WORKING_ROW + 1 + len(df))
         df = df[df["Наименование"].str.strip() != ""].copy()
 
@@ -154,7 +153,7 @@ def identify_target_store(comment):
     return "Общий"
 
 # ─────────────────────────────────────────────
-# 4. ПОДГОТОВКА ДАННЫХ ДЛЯ ИНТЕРФЕЙСА
+# 4. ПОДГОТОВКА ДАННЫХ И КОНСТАНТЫ КОЛОНОК (ИСПРАВЛЕНО)
 # ─────────────────────────────────────────────
 df_mem, C = load_data_integrated()
 
@@ -162,7 +161,7 @@ if df_mem.empty:
     st.warning("Данные не найдены.")
     st.stop()
 
-# Маппинг имен колонок
+# Маппинг имен колонок из датафрейма
 C_ORDER_NAME   = df_mem.columns[C['ORDER']]
 C_PRODUCT_NAME = df_mem.columns[C['PRODUCT']]
 C_QTY_NAME     = df_mem.columns[C['QTY']]
@@ -174,10 +173,12 @@ C_MOVE_NAME    = df_mem.columns[C['MOVE']]
 C_DONE_NAME    = df_mem.columns[C['DONE']]
 C_STATUS_NAME  = df_mem.columns[C['STATUS']]
 
+# Глобальные настройки отображения таблиц (доступны всем вкладкам)
+TABLE_COLS = [C_ORDER_NAME, C_PRODUCT_NAME, C_QTY_NAME, C_WH_NAME, C_COMMENT_NAME]
 COL_RENAME = {
     C_ORDER_NAME: "Заказ", C_PRODUCT_NAME: "Товар", C_QTY_NAME: "Кол",
     C_WH_NAME: "Склад", C_COMMENT_NAME: "Коммент", C_DONE_NAME: "Собрано",
-    C_STATUS_NAME: "Статус"
+    C_STATUS_NAME: "Статус", C_EDIT_NAME: "Правки"
 }
 
 # Отслеживание новых заказов
@@ -223,10 +224,11 @@ if "Магазин" in menu:
     is_f_match = work_base[C_WH_NAME].str.contains('|'.join(wh_keywords), case=False, na=False) & ~is_pz_row
     is_pz_match = (work_base[C_WH_NAME] == f"ПЗ {current_page_store}") & (work_base[C_INWORK_NAME] == "TRUE")
 
-    sending_df   = work_base[(is_f_match | is_pz_match) & (work_base[C_MOVE_NAME] != "TRUE")]
+    sending_df  = work_base[(is_f_match | is_pz_match) & (work_base[C_MOVE_NAME] != "TRUE")]
     receiving_df = work_base[(work_base[C_MOVE_NAME] == "TRUE") & (work_base[C_COMMENT_NAME].apply(identify_target_store) == current_page_store)]
 
     display_df = pd.concat([sending_df, receiving_df]).drop_duplicates(subset=["_sheet_row"])
+    
     # Скрыть собранное, если нет активных правок
     display_df = display_df[
         (display_df[C_DONE_NAME] != "TRUE") |
@@ -235,7 +237,6 @@ if "Магазин" in menu:
     display_df["_target_store"] = display_df[C_COMMENT_NAME].apply(identify_target_store)
 
     col1, col2 = st.columns(2)
-    TABLE_COLS = [C_ORDER_NAME, C_PRODUCT_NAME, C_QTY_NAME, C_WH_NAME, C_COMMENT_NAME]
 
     with col1:
         st.subheader("🆕 Новые / Изменения")
@@ -249,7 +250,7 @@ if "Магазин" in menu:
             has_active_edit = (group[C_EDIT_NAME] != "").any() and oid not in st.session_state.reviewed_changes
 
             tag = ((" ⚠️ ПРАВКА" if has_active_edit else "") + (" ⏳ ПЗ" if is_pz_item else "") + 
-                   (" 🚚 В ПУТИ" if is_incoming else "") + (f" 📦 В {target.upper()}" if needs_move else ""))
+                    (" 🚚 В ПУТИ" if is_incoming else "") + (f" 📦 В {target.upper()}" if needs_move else ""))
 
             with st.expander(f"Заказ №{oid}{tag}"):
                 if has_active_edit: st.error(f"Правка: {group[C_EDIT_NAME].iloc[0]}")
@@ -312,9 +313,13 @@ elif menu == "🚚 Перемещения (Активные)":
 
 elif menu == "✅ Выполненные сборки":
     st.title("✅ Архив (Последние 100)")
+    # Используем TABLE_COLS + колонка Собрано
+    archive_cols = TABLE_COLS + [C_DONE_NAME]
     done_df = work_base[work_base[C_DONE_NAME] == "TRUE"].iloc[::-1].head(100)
-    st.dataframe(done_df[[C_ORDER_NAME, C_PRODUCT_NAME, C_QTY_NAME, C_WH_NAME, C_DONE_NAME]].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
+    st.dataframe(done_df[archive_cols].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
 
 elif menu == "🚫 Отмененные заказы":
     st.title("🚫 Отмененные заказы")
-    st.dataframe(canceled_df[[C_ORDER_NAME, C_PRODUCT_NAME, C_QTY_NAME, C_WH_NAME, C_COMMENT_NAME, C_STATUS_NAME]].iloc[::-1].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
+    # Используем TABLE_COLS + колонка Статус
+    cancel_view_cols = TABLE_COLS + [C_STATUS_NAME]
+    st.dataframe(canceled_df[cancel_view_cols].iloc[::-1].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
