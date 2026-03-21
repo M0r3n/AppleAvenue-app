@@ -3,6 +3,7 @@ import gspread
 import pandas as pd
 import json
 import os
+import time
 from datetime import datetime
 import extra_streamlit_components as stx
 from streamlit_autorefresh import st_autorefresh
@@ -20,8 +21,7 @@ FALSE_VAL    = "FALSE"
 # ── НАСТРОЙКА СТРАНИЦЫ ───────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
 
-# Инициализация менеджера куки
-@st.cache_resource
+# Инициализируем менеджер куки БЕЗ КЭША (исправление CachedWidgetWarning)
 def get_cookie_manager():
     return stx.CookieManager()
 
@@ -66,17 +66,26 @@ if "local_in_work" not in st.session_state:
 
 # ── АВТОРИЗАЦИЯ (COOKIES) ─────────────────────────────────────────────────────
 def check_password() -> bool:
-    # 1. Если уже авторизован в текущей сессии
+    # 1. Если уже авторизован в текущей сессии — пропускаем сразу
     if st.session_state.password_correct:
         return True
 
-    # 2. Пытаемся достать токен из куки браузера
-    auth_token = cookie_manager.get("auth_token")
+    # 2. Получаем куки. Если менеджер еще не инициализирован, куки придут через миг
+    all_cookies = cookie_manager.get_all()
+    
+    # Небольшая пауза, если куки еще "пустые" (нужна для первого прогона JS)
+    if not all_cookies:
+        time.sleep(0.1)
+        all_cookies = cookie_manager.get_all()
+
+    auth_token = all_cookies.get("auth_token")
+
+    # Проверка токена
     if auth_token and auth_token == st.secrets.get("password"):
         st.session_state.password_correct = True
         return True
 
-    # 3. Форма входа
+    # 3. Форма входа (если куки нет или она неверна)
     st.title("🔐 Вход в систему")
     if "password" not in st.secrets:
         st.error("Ошибка: Пароль не настроен в Secrets.")
@@ -87,12 +96,17 @@ def check_password() -> bool:
         if pwd == st.secrets["password"]:
             st.session_state.password_correct = True
             # Записываем куки на 30 дней
-            cookie_manager.set("auth_token", pwd, expires_at=datetime.now() + pd.Timedelta(days=30))
+            cookie_manager.set(
+                "auth_token", 
+                pwd, 
+                expires_at=datetime.now() + pd.Timedelta(days=30)
+            )
             st.rerun()
         else:
             st.error("❌ Неверный код")
     return False
 
+# Сначала проверяем пароль, потом всё остальное
 if not check_password():
     st.stop()
 
@@ -144,8 +158,7 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
     headers = [str(h).strip().replace("\n", " ") for h in raw_data[header_idx]]
 
     def col_idx(name: str) -> int:
-        if name not in headers:
-            raise ValueError(f"Колонка '{name}' не найдена")
+        if name not in headers: raise ValueError(f"Колонка '{name}' не найдена")
         return headers.index(name)
 
     try:
