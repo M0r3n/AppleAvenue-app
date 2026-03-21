@@ -349,16 +349,16 @@ def render_store(current_store: str) -> None:
                     and oid not in st.session_state.reviewed_changes
                 )
                 tag = (
-                    (" ⚠️ ПРАВКА" if has_edit else "")
+                    (" ⚠️ Изменение" if has_edit else "")
                     + (" ⏳ ПЗ" if is_pz_item else "")
                     + (" 🚚 ЕДЕТ" if incoming else "")
                 )
                 with st.expander(f"Заказ №{oid}{tag}"):
                     if has_edit:
-                        st.error(f"Правка: {group[C_EDIT].iloc[0]}")
+                        st.error(f"Изменение: {group[C_EDIT].iloc[0]}")
                     render_order_table(group, TABLE_COLS, COL_RENAME)
                     if has_edit:
-                        if st.button("Учесть правку", key=f"rev_n_{oid}"):
+                        if st.button("Учесть Изменение", key=f"rev_n_{oid}"):
                             st.session_state.reviewed_changes.add(oid)
                             save_persistent_state()
                             st.rerun()
