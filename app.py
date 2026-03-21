@@ -1,9 +1,33 @@
 import streamlit as st
 import gspread
 import pandas as pd
+import json
+import os
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 from google.oauth2.credentials import Credentials
+
+# --- СИСТЕМА ПАМЯТИ (ПЕРСИСТЕНТНОСТЬ) ---
+DB_FILE = "orders_persistent_state.json"
+
+def load_persistent_state():
+    """Загружает сохраненные сеты из файла при старте"""
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                data = json.load(f)
+                return set(data.get("local_in_work", [])), set(data.get("reviewed_changes", []))
+        except:
+            return set(), set()
+    return set(), set()
+
+def save_persistent_state():
+    """Сохраняет текущие сеты из session_state в файл"""
+    with open(DB_FILE, "w") as f:
+        json.dump({
+            "local_in_work": list(st.session_state.local_in_work),
+            "reviewed_changes": list(st.session_state.reviewed_changes)
+        }, f)
 
 # 1. НАСТРОЙКИ СТРАНИЦЫ И БЕЗОПАСНОСТЬ
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
@@ -34,10 +58,12 @@ if not check_password():
 # Авто-обновление (10 минут)
 st_autorefresh(interval=600_000, key="data_refresh")
 
-# Инициализация состояний
+# Инициализация состояний с учетом памяти
+saved_in_work, saved_reviewed = load_persistent_state()
+
 for key, default in [
-    ("local_in_work", set()), 
-    ("reviewed_changes", set()), 
+    ("local_in_work", saved_in_work), 
+    ("reviewed_changes", saved_reviewed), 
     ("prev_order_ids", set()), 
     ("new_orders_alert", set()),
     ("last_sync", "Не обновлялось")
@@ -48,10 +74,10 @@ for key, default in [
 # КОНСТАНТЫ
 SHEET_ID = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
 TAB_NAME = "Заказы ИМ Авеню"
-PZ_LIST  = ["ПЗ Пекин", "ПЗ Горбушка"]
+PZ_LIST = ["ПЗ Пекин", "ПЗ Горбушка"]
 START_WORKING_ROW = 26596
 
-# 2. ПОДКЛЮЧЕНИЕ К GOOGLE (ОБЛАЧНОЕ ЧЕРЕЗ SECRETS)
+# 2. ПОДКЛЮЧЕНИЕ К GOOGLE
 @st.cache_resource
 def get_client():
     try:
@@ -143,7 +169,7 @@ C_INWORK_NAME = df_mem.columns[C['INWORK']]
 TABLE_COLS = [C_ORDER_NAME, C_PRODUCT_NAME, C_QTY_NAME, C_WH_NAME, C_COMMENT_NAME]
 COL_RENAME = {C_ORDER_NAME: "Заказ", C_PRODUCT_NAME: "Товар", C_QTY_NAME: "Кол", C_WH_NAME: "Склад", C_COMMENT_NAME: "Коммент"}
 
-# Логика новых заказов (алерты)
+# Логика новых заказов
 current_order_ids = set(df_mem[C_ORDER_NAME].unique())
 if st.session_state.prev_order_ids:
     st.session_state.new_orders_alert = current_order_ids - st.session_state.prev_order_ids
@@ -163,14 +189,14 @@ menu = st.sidebar.selectbox("Выберите раздел:", [
 
 st.sidebar.caption(f"🔄 Синхронизация: {st.session_state.last_sync}")
 if st.sidebar.button("🔃 Обновить вручную"):
-    load_data_integrated.clear(); st.rerun()
+    load_data_integrated.clear()
+    st.rerun()
 
 # 6. ЛОГИКА РАЗДЕЛОВ МАГАЗИНА
 if "Магазин" in menu:
     current_store = "Горбушка" if "ГОРБУШКА" in menu else "Пекин"
     st.title(f"🏪 Заказы: {current_store}")
 
-    # Алерт о новых
     store_new_alert = {oid for oid in st.session_state.new_orders_alert if oid in work_base[C_ORDER_NAME].values}
     if store_new_alert:
         st.success(f"🆕 Появились новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
@@ -185,7 +211,6 @@ if "Магазин" in menu:
         ((work_base[C_MOVE_NAME] == "TRUE") & (work_base[C_COMMENT_NAME].apply(identify_target_store) == current_store))
     ].copy()
 
-    # Фильтр "Скрывать собранное", если нет правок
     display_df = display_df[
         (display_df[C_DONE_NAME] != "TRUE") | 
         ((display_df[C_DONE_NAME] == "TRUE") & (display_df[C_EDIT_NAME] != "") & (~display_df[C_ORDER_NAME].isin(st.session_state.reviewed_changes)))
@@ -213,10 +238,14 @@ if "Магазин" in menu:
                     
                     if has_edit:
                         if st.button("Учесть правку", key=f"rev_n_{oid}"):
-                            st.session_state.reviewed_changes.add(oid); st.rerun()
+                            st.session_state.reviewed_changes.add(oid)
+                            save_persistent_state()
+                            st.rerun()
                     else:
                         if st.button("В работу", key=f"w_{oid}"):
-                            st.session_state.local_in_work.add(oid); st.rerun()
+                            st.session_state.local_in_work.add(oid)
+                            save_persistent_state()
+                            st.rerun()
 
     with col2:
         st.subheader("🛠 В сборке")
@@ -233,19 +262,25 @@ if "Магазин" in menu:
                     if has_edit:
                         st.error(f"Правка: {group[C_EDIT_NAME].iloc[0]}")
                         if st.button("Учесть правку", key=f"rev_w_{oid}"):
-                            st.session_state.reviewed_changes.add(oid); st.rerun()
+                            st.session_state.reviewed_changes.add(oid)
+                            save_persistent_state()
+                            st.rerun()
                     else:
                         st.table(group[TABLE_COLS].rename(columns=COL_RENAME))
                         if target != current_store and target != "Общий" and not is_incoming:
                             if st.button("🚛 Отправить перемещение", key=f"mv_{oid}"):
                                 update_google_cells(group, {C['MOVE']: "TRUE"})
-                                st.session_state.local_in_work.discard(oid); st.rerun()
+                                st.session_state.local_in_work.discard(oid)
+                                save_persistent_state()
+                                st.rerun()
                         else:
                             btn_label = "✅ Принято и собрано" if is_incoming else "✅ Завершить сборку"
                             if st.button(btn_label, key=f"dn_{oid}", type="primary"):
                                 update_google_cells(group, {C['DONE']: "TRUE", C['MOVE']: "FALSE"})
                                 st.session_state.local_in_work.discard(oid)
-                                st.session_state.reviewed_changes.discard(oid); st.rerun()
+                                st.session_state.reviewed_changes.discard(oid)
+                                save_persistent_state()
+                                st.rerun()
 
 # 7. ОСТАЛЬНЫЕ РАЗДЕЛЫ
 elif menu == "🚚 Перемещения (Активные)":
@@ -256,7 +291,8 @@ elif menu == "🚚 Перемещения (Активные)":
         with st.expander(f"Перемещение №{oid}"):
             st.table(group[TABLE_COLS].rename(columns=COL_RENAME))
             if st.button("Удалить из списка", key=f"cl_mv_{oid}"):
-                update_google_cells(group, {C['MOVE']: "FALSE"}); st.rerun()
+                update_google_cells(group, {C['MOVE']: "FALSE"})
+                st.rerun()
 
 elif menu == "⏳ Товар Под заказ":
     st.title("⏳ Ожидание ПЗ")
