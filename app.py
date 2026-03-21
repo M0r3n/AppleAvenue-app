@@ -3,6 +3,7 @@ import gspread
 import pandas as pd
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 from google.oauth2.credentials import Credentials
@@ -17,58 +18,69 @@ START_ROW    = 26596
 TRUE_VAL     = "TRUE"
 FALSE_VAL    = "FALSE"
 
-# ── СТРАНИЦА И АВТОРИЗАЦИЯ ───────────────────────────────────────────────────
+# ── НАСТРОЙКА СТРАНИЦЫ ───────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
 
-# Инициализируем менеджер куки (без кэширования, чтобы избежать ошибок)
-cookie_manager = stx.CookieManager(key="avenue_cookie_manager")
+# Инициализируем менеджер куки (без кэша!)
+cookie_manager = stx.CookieManager(key="avenue_auth_manager_v2")
 
 def check_password() -> bool:
-    # 1. Проверка в текущей сессии (оперативка)
+    """Проверяет пароль или наличие валидной куки с задержкой на чтение."""
+    # 1. Если уже авторизован в текущей сессии (в ОЗУ)
     if st.session_state.get("password_correct"):
         return True
 
-    # 2. Проверка куки в браузере
-    auth_status = cookie_manager.get(cookie="avenue_auth_status")
+    # 2. Даем компоненту время связаться с браузером (0.5 сек достаточно)
+    time.sleep(0.5)
+    all_cookies = cookie_manager.get_all()
     
-    if auth_status == "authorized":
+    # Если куки еще не подгрузились (компонент возвращает None в первую секунду)
+    if all_cookies is None:
+        st.info("🔄 Проверка авторизации на устройстве...")
+        st.stop()
+
+    # Извлекаем статус. Приводим к строке для надежности
+    auth_status = all_cookies.get("avenue_auth_status")
+    
+    if str(auth_status) == "authorized":
         st.session_state.password_correct = True
         return True
 
-    # 3. Форма входа
+    # 3. Форма входа, если куки нет
     st.title("🔐 Вход в систему")
     
-    # Небольшое уведомление, пока подгружаются куки
-    if auth_status is None:
-        st.caption("Проверка сохраненной авторизации...")
-
     if "password" not in st.secrets:
         st.error("Критическая ошибка: Пароль не настроен в Secrets.")
         st.stop()
 
-    pwd = st.text_input("Введите код доступа:", type="password")
+    pwd = st.text_input("Введите код доступа:", type="password", key="login_pwd_input")
     remember_me = st.checkbox("Запомнить меня на этом устройстве", value=True)
     
-    if st.button("Войти"):
+    if st.button("Войти", key="login_submit_btn"):
         if pwd == st.secrets["password"]:
-            st.session_state.password_correct = True
             if remember_me:
-                # Сохраняем "ключ" в браузере на 30 дней
+                # Записываем куку на 30 дней
                 cookie_manager.set(
                     "avenue_auth_status", 
                     "authorized", 
                     expires_at=datetime.now() + timedelta(days=30),
-                    key="set_auth_cookie"
+                    key="save_auth_cookie_action"
                 )
+                # Ждем 1 секунду, чтобы браузер успел физически сохранить файл
+                time.sleep(1.0)
+            
+            st.session_state.password_correct = True
             st.rerun()
         else:
             st.error("❌ Неверный код")
     return False
 
+# Запуск проверки пароля
 if not check_password():
     st.stop()
 
-# ── ПЕРСИСТЕНТНОСТЬ (СОСТОЯНИЕ ЗАКАЗОВ) ──────────────────────────────────────
+# ── ДАЛЬНЕЙШАЯ ЛОГИКА ПРИЛОЖЕНИЯ (ТОЛЬКО ДЛЯ АВТОРИЗОВАННЫХ) ──────────────────
+
 def load_persistent_state() -> tuple[set, set]:
     if os.path.exists(DB_FILE):
         try:
@@ -202,7 +214,6 @@ def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) 
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 df_mem, C = load_data_integrated()
-
 if df_mem.empty or not C:
     st.error("Не удалось загрузить данные.")
     st.stop()
@@ -243,6 +254,7 @@ menu = st.sidebar.selectbox(
 
 if st.sidebar.button("🚪 Выйти (сбросить вход)"):
     cookie_manager.delete("avenue_auth_status")
+    time.sleep(0.5)
     st.session_state.password_correct = False
     st.rerun()
 
@@ -251,7 +263,7 @@ if st.sidebar.button("🔃 Обновить вручную"):
     load_data_integrated.clear()
     st.rerun()
 
-# ── РАЗДЕЛ: МАГАЗИН ───────────────────────────────────────────────────────────
+# ── РАЗДЕЛ: МАГАЗИН (ОСНОВНОЙ КОНТЕНТ) ───────────────────────────────────────
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
     store_new_alert = {oid for oid in st.session_state.new_orders_alert if oid in work_base[C_ORDER].values}
