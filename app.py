@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 from google.oauth2.credentials import Credentials
-import extra_streamlit_components as stx  # Добавлено для работы с куками
+import extra_streamlit_components as stx
 
 # ── КОНСТАНТЫ ────────────────────────────────────────────────────────────────
 DB_FILE      = "orders_persistent_state.json"
@@ -17,7 +17,58 @@ START_ROW    = 26596
 TRUE_VAL     = "TRUE"
 FALSE_VAL    = "FALSE"
 
-# ── ПЕРСИСТЕНТНОСТЬ (ФАЙЛОВАЯ) ────────────────────────────────────────────────
+# ── СТРАНИЦА И АВТОРИЗАЦИЯ ───────────────────────────────────────────────────
+st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
+
+# Инициализируем менеджер куки (без кэширования, чтобы избежать ошибок)
+cookie_manager = stx.CookieManager(key="avenue_cookie_manager")
+
+def check_password() -> bool:
+    # 1. Проверка в текущей сессии (оперативка)
+    if st.session_state.get("password_correct"):
+        return True
+
+    # 2. Проверка куки в браузере
+    auth_status = cookie_manager.get(cookie="avenue_auth_status")
+    
+    if auth_status == "authorized":
+        st.session_state.password_correct = True
+        return True
+
+    # 3. Форма входа
+    st.title("🔐 Вход в систему")
+    
+    # Небольшое уведомление, пока подгружаются куки
+    if auth_status is None:
+        st.caption("Проверка сохраненной авторизации...")
+
+    if "password" not in st.secrets:
+        st.error("Критическая ошибка: Пароль не настроен в Secrets.")
+        st.stop()
+
+    pwd = st.text_input("Введите код доступа:", type="password")
+    remember_me = st.checkbox("Запомнить меня на этом устройстве", value=True)
+    
+    if st.button("Войти"):
+        if pwd == st.secrets["password"]:
+            st.session_state.password_correct = True
+            if remember_me:
+                # Сохраняем "ключ" в браузере на 30 дней
+                cookie_manager.set(
+                    "avenue_auth_status", 
+                    "authorized", 
+                    expires_at=datetime.now() + timedelta(days=30),
+                    key="set_auth_cookie"
+                )
+            st.rerun()
+        else:
+            st.error("❌ Неверный код")
+    return False
+
+if not check_password():
+    st.stop()
+
+# ── ПЕРСИСТЕНТНОСТЬ (СОСТОЯНИЕ ЗАКАЗОВ) ──────────────────────────────────────
 def load_persistent_state() -> tuple[set, set]:
     if os.path.exists(DB_FILE):
         try:
@@ -44,55 +95,7 @@ def save_persistent_state() -> None:
     except OSError as e:
         st.warning(f"Не удалось сохранить состояние: {e}")
 
-# ── СТРАНИЦА И АВТОРИЗАЦИЯ (С КУКАМИ) ──────────────────────────────────────────
-st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
-
-@st.cache_resource
-def get_cookie_manager():
-    return stx.CookieManager()
-
-def check_password() -> bool:
-    """Проверяет пароль или наличие валидной куки 'authenticated'."""
-    cookie_manager = get_cookie_manager()
-    
-    # 1. Если уже авторизован в текущей сессии
-    if st.session_state.get("password_correct"):
-        return True
-
-    # 2. Проверяем куки (может потребоваться секунда на загрузку компонента)
-    auth_cookie = cookie_manager.get(cookie="avenue_auth_status")
-    if auth_cookie == "authorized":
-        st.session_state.password_correct = True
-        return True
-
-    # 3. Форма входа
-    st.title("🔐 Вход в систему")
-    if "password" not in st.secrets:
-        st.error("Критическая ошибка: Пароль не настроен в Secrets.")
-        st.stop()
-
-    pwd = st.text_input("Введите код доступа:", type="password")
-    remember_me = st.checkbox("Запомнить меня на этом устройстве", value=True)
-    
-    if st.button("Войти"):
-        if pwd == st.secrets["password"]:
-            st.session_state.password_correct = True
-            if remember_me:
-                # Устанавливаем куку на 30 дней
-                cookie_manager.set(
-                    "avenue_auth_status", 
-                    "authorized", 
-                    expires_at=datetime.now() + timedelta(days=30)
-                )
-            st.rerun()
-        else:
-            st.error("❌ Неверный код")
-    return False
-
-if not check_password():
-    st.stop()
-
-# ── ИНИЦИАЛИЗАЦИЯ ДАННЫХ ──────────────────────────────────────────────────────
+# Авто-обновление каждые 10 минут
 st_autorefresh(interval=600_000, key="data_refresh")
 
 if "local_in_work" not in st.session_state:
@@ -138,12 +141,9 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
         return pd.DataFrame(), {}
 
     header_idx = next(
-        (
-            i for i, row in enumerate(raw_data[:100])
-            if "Наименование" in row
-            and "Склад" in row
-            and not any("ячейку" in str(c) for c in row)
-        ),
+        (i for i, row in enumerate(raw_data[:100])
+         if "Наименование" in row and "Склад" in row
+         and not any("ячейку" in str(c) for c in row)),
         -1,
     )
     if header_idx == -1:
@@ -193,10 +193,8 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
 # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
 def identify_target_store(comment: str) -> str:
     c = str(comment).lower()
-    if any(x in c for x in ("пек", "пкн", "pekin")):
-        return "Пекин"
-    if any(x in c for x in ("горб", "грб", "gorb")):
-        return "Горбушка"
+    if any(x in c for x in ("пек", "пкн", "pekin")): return "Пекин"
+    if any(x in c for x in ("горб", "грб", "gorb")): return "Горбушка"
     return "Общий"
 
 def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
@@ -204,8 +202,9 @@ def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) 
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 df_mem, C = load_data_integrated()
+
 if df_mem.empty or not C:
-    st.error("Не удалось загрузить данные. Проверьте подключение к таблице.")
+    st.error("Не удалось загрузить данные.")
     st.stop()
 
 cols = df_mem.columns
@@ -226,8 +225,7 @@ COL_RENAME = {C_ORDER: "Заказ", C_PRODUCT: "Товар", C_QTY: "Кол", C
 current_order_ids = set(df_mem[C_ORDER].unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
-    if new_ids:
-        st.session_state.new_orders_alert = new_ids
+    if new_ids: st.session_state.new_orders_alert = new_ids
 if current_order_ids != st.session_state.prev_order_ids:
     st.session_state.prev_order_ids = current_order_ids
 
@@ -243,8 +241,7 @@ menu = st.sidebar.selectbox(
     ["🏪 Магазин: ГОРБУШКА", "🏪 Магазин: ПЕКИН", "🚚 Перемещения (Активные)", "⏳ Товар Под заказ", "✅ Выполненные сборки", "🚫 Отмененные заказы"]
 )
 
-if st.sidebar.button("🚪 Выйти (забыть меня)"):
-    cookie_manager = get_cookie_manager()
+if st.sidebar.button("🚪 Выйти (сбросить вход)"):
     cookie_manager.delete("avenue_auth_status")
     st.session_state.password_correct = False
     st.rerun()
@@ -288,13 +285,10 @@ def render_store(current_store: str) -> None:
                     render_order_table(group, TABLE_COLS, COL_RENAME)
                     if has_edit:
                         if st.button("Учесть правку", key=f"rev_n_{oid}"):
-                            st.session_state.reviewed_changes.add(oid)
-                            save_persistent_state()
-                            st.rerun()
+                            st.session_state.reviewed_changes.add(oid); save_persistent_state(); st.rerun()
                     elif st.button("В работу", key=f"w_{oid}"):
-                        st.session_state.local_in_work.add(oid)
-                        save_persistent_state()
-                        st.rerun()
+                        st.session_state.local_in_work.add(oid); save_persistent_state(); st.rerun()
+
     with col2:
         st.subheader("🛠 В сборке")
         in_work = display_df[display_df[C_ORDER].isin(st.session_state.local_in_work)]
@@ -309,23 +303,18 @@ def render_store(current_store: str) -> None:
                     render_order_table(group, TABLE_COLS, COL_RENAME)
                     if has_edit:
                         if st.button("Учесть правку", key=f"rev_w_{oid}"):
-                            st.session_state.reviewed_changes.add(oid)
-                            save_persistent_state()
-                            st.rerun()
+                            st.session_state.reviewed_changes.add(oid); save_persistent_state(); st.rerun()
                     elif target != current_store and target != "Общий" and not is_incoming:
                         if st.button("🚛 Отправить перемещение", key=f"mv_{oid}"):
                             update_google_cells(group, C, {"MOVE": TRUE_VAL})
-                            st.session_state.local_in_work.discard(oid)
-                            save_persistent_state()
-                            st.rerun()
+                            st.session_state.local_in_work.discard(oid); save_persistent_state(); st.rerun()
                     else:
                         btn_label = "✅ Принято и собрано" if is_incoming else "✅ Завершить сборку"
                         if st.button(btn_label, key=f"dn_{oid}", type="primary"):
                             update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
                             st.session_state.local_in_work.discard(oid)
                             st.session_state.reviewed_changes.discard(oid)
-                            save_persistent_state()
-                            st.rerun()
+                            save_persistent_state(); st.rerun()
 
 # ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
 if "Магазин" in menu:
