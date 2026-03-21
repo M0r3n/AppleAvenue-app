@@ -6,19 +6,20 @@ import os
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 from google.oauth2.credentials import Credentials
+import extra_streamlit_components as stx  # Библиотека для работы с Cookie
 
 # ── КОНСТАНТЫ ────────────────────────────────────────────────────────────────
 DB_FILE      = "orders_persistent_state.json"
 SHEET_ID     = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
 TAB_NAME     = "Заказы ИМ Авеню"
 PZ_LIST      = ["ПЗ Пекин", "ПЗ Горбушка"]
-START_ROW    = 26596          # первая строка данных на листе
+START_ROW    = 26596
 TRUE_VAL     = "TRUE"
 FALSE_VAL    = "FALSE"
+COOKIE_KEY   = "avenue_auth_token"  # Ключ для хранения в браузере
 
-# ── ПЕРСИСТЕНТНОСТЬ ───────────────────────────────────────────────────────────
+# ── ПЕРСИСТЕНТНОСТЬ (ФАЙЛОВАЯ) ────────────────────────────────────────────────
 def load_persistent_state() -> tuple[set, set]:
-    """Читает local_in_work и reviewed_changes из JSON-файла."""
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE) as f:
@@ -31,9 +32,7 @@ def load_persistent_state() -> tuple[set, set]:
             pass
     return set(), set()
 
-
 def save_persistent_state() -> None:
-    """Сохраняет текущее состояние session_state на диск."""
     try:
         with open(DB_FILE, "w") as f:
             json.dump(
@@ -46,15 +45,25 @@ def save_persistent_state() -> None:
     except OSError as e:
         st.warning(f"Не удалось сохранить состояние: {e}")
 
-
-# ── СТРАНИЦА И АВТОРИЗАЦИЯ ───────────────────────────────────────────────────
-st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
-
-
+# ── АВТОРИЗАЦИЯ ЧЕРЕЗ COOKIE ─────────────────────────────────────────────────
 def check_password() -> bool:
+    """Проверяет пароль и сохраняет 'куку' в браузере для авто-входа."""
+    
+    # Инициализируем менеджер куки
+    cookie_manager = stx.CookieManager()
+    
+    # Даем время библиотеке загрузить куки из браузера
+    auth_cookie = cookie_manager.get(COOKIE_KEY)
+
+    # 1. Если кука совпадает с паролем из секретов — пускаем сразу
+    if auth_cookie == st.secrets["password"]:
+        return True
+
+    # 2. Если в сессии уже отмечено, что вход выполнен
     if st.session_state.get("password_correct"):
         return True
 
+    # 3. Форма входа, если авторизации нет
     st.title("🔐 Вход в систему")
     if "password" not in st.secrets:
         st.error("Критическая ошибка: Пароль не настроен в Secrets.")
@@ -63,12 +72,22 @@ def check_password() -> bool:
     pwd = st.text_input("Введите код доступа:", type="password")
     if st.button("Войти"):
         if pwd == st.secrets["password"]:
+            # Сохраняем в session_state (для текущей сессии)
             st.session_state.password_correct = True
+            
+            # Сохраняем в браузер (на 30 дней)
+            cookie_manager.set(
+                COOKIE_KEY, 
+                pwd, 
+                expires_at=datetime.now() + pd.Timedelta(days=30)
+            )
             st.rerun()
         else:
             st.error("❌ Неверный код")
     return False
 
+# ── ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКА СТРАНИЦЫ ───────────────────────────────────────
+st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
 
 if not check_password():
     st.stop()
@@ -76,7 +95,7 @@ if not check_password():
 # Авто-обновление каждые 10 минут
 st_autorefresh(interval=600_000, key="data_refresh")
 
-# Инициализация session_state (выполняется один раз)
+# Инициализация session_state
 if "local_in_work" not in st.session_state:
     saved_in_work, saved_reviewed = load_persistent_state()
     st.session_state.local_in_work    = saved_in_work
@@ -85,11 +104,9 @@ if "local_in_work" not in st.session_state:
     st.session_state.new_orders_alert = set()
     st.session_state.last_sync        = "Не обновлялось"
 
-
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_client() -> gspread.Client:
-    """Создаёт и кеширует авторизованный gspread-клиент."""
     try:
         gs = st.secrets["connections"]["gsheets"]
         creds = Credentials.from_authorized_user_info(
@@ -106,9 +123,7 @@ def get_client() -> gspread.Client:
         st.error(f"Ошибка авторизации Google: {e}")
         st.stop()
 
-
 def get_worksheet() -> gspread.Worksheet:
-    """Возвращает нужный лист; при ошибке берёт первый."""
     client = get_client()
     spreadsheet = client.open_by_key(SHEET_ID)
     try:
@@ -116,19 +131,13 @@ def get_worksheet() -> gspread.Worksheet:
     except gspread.WorksheetNotFound:
         return spreadsheet.get_worksheet(0)
 
-
 @st.cache_data(ttl=600)
 def load_data_integrated() -> tuple[pd.DataFrame, dict]:
-    """
-    Загружает данные из Google Sheets.
-    Возвращает DataFrame и словарь col_map с именами колонок.
-    """
     sheet    = get_worksheet()
     raw_data = sheet.get_all_values()
     if not raw_data:
         return pd.DataFrame(), {}
 
-    # Ищем строку-заголовок
     header_idx = next(
         (
             i for i, row in enumerate(raw_data[:100])
@@ -143,7 +152,6 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
 
     headers = [str(h).strip().replace("\n", " ") for h in raw_data[header_idx]]
 
-    # Безопасный поиск индекса колонки
     def col_idx(name: str) -> int:
         if name not in headers:
             raise ValueError(f"Колонка '{name}' не найдена в таблице")
@@ -151,10 +159,10 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
 
     try:
         col_map = {
-            "ORDER":   col_idx("Наименование") - 1,   # колонка левее «Наименования»
+            "ORDER":   col_idx("Наименование") - 1,
             "PRODUCT": col_idx("Наименование"),
-            "QTY":     col_idx("Кол-во"),
-            "WH":      col_idx("Склад"),
+            "QTY":      col_idx("Кол-во"),
+            "WH":       col_idx("Склад"),
             "COMMENT": col_idx("Комментарий"),
             "EDIT":    col_idx("Изменения заказа"),
             "INWORK":  col_idx("Под ЗАКАЗ"),
@@ -173,12 +181,7 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
     st.session_state.last_sync = datetime.now().strftime("%H:%M:%S")
     return df, col_map
 
-
 def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> None:
-    """
-    Записывает updates = {col_key: value, …} в ячейки Google Sheets
-    для всех строк переданной группы.
-    """
     sheet     = get_worksheet()
     cell_list = [
         gspread.Cell(row=int(row_num), col=col_map[key] + 1, value=val)
@@ -187,7 +190,6 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
     ]
     sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
     load_data_integrated.clear()
-
 
 # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
 def identify_target_store(comment: str) -> str:
@@ -198,10 +200,8 @@ def identify_target_store(comment: str) -> str:
         return "Горбушка"
     return "Общий"
 
-
 def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
     st.table(group[table_cols].rename(columns=col_rename))
-
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 df_mem, C = load_data_integrated()
@@ -210,7 +210,6 @@ if df_mem.empty or not C:
     st.error("Не удалось загрузить данные. Проверьте подключение к таблице.")
     st.stop()
 
-# Имена колонок по индексам из col_map
 cols = df_mem.columns
 C_ORDER   = cols[C["ORDER"]]
 C_PRODUCT = cols[C["PRODUCT"]]
@@ -232,23 +231,18 @@ COL_RENAME = {
     C_COMMENT: "Коммент",
 }
 
-# Обнаружение новых заказов (только при реальном изменении набора)
 current_order_ids = set(df_mem[C_ORDER].unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
-    if new_ids:                                   # обновляем только при появлении новых
+    if new_ids:
         st.session_state.new_orders_alert = new_ids
 if current_order_ids != st.session_state.prev_order_ids:
     st.session_state.prev_order_ids = current_order_ids
 
-# Фильтрация отменённых
 is_canceled = df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)
 canceled_df = df_mem[is_canceled].copy()
 work_base   = df_mem[~is_canceled].copy()
-
-# Предвычисляем целевой магазин для всего DataFrame (вместо вызовов в каждом цикле)
 work_base["_target_store"] = work_base[C_COMMENT].apply(identify_target_store)
-
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
@@ -264,12 +258,18 @@ menu = st.sidebar.selectbox(
     ],
 )
 st.sidebar.caption(f"🔄 Синхронизация: {st.session_state.last_sync}")
+
+# Кнопка выхода (очистка куки)
+if st.sidebar.button("🔓 Выйти из системы"):
+    stx.CookieManager().delete(COOKIE_KEY)
+    st.session_state.password_correct = False
+    st.rerun()
+
 if st.sidebar.button("🔃 Обновить вручную"):
     load_data_integrated.clear()
     st.rerun()
 
-
-# ── РАЗДЕЛ: МАГАЗИН ───────────────────────────────────────────────────────────
+# ── РАЗДЕЛ: МАГАЗИН (RENDER) ──────────────────────────────────────────────────
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
 
@@ -278,42 +278,24 @@ def render_store(current_store: str) -> None:
         if oid in work_base[C_ORDER].values
     }
     if store_new_alert:
-        st.success(f"🆕 Появились новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
+        st.success(f"🆕 Новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
 
     wh_keywords = ["Горб", "Сток"] if current_store == "Горбушка" else ["Пекин"]
     is_pz_row   = work_base[C_WH].isin(PZ_LIST)
-    is_f_match  = (
-        work_base[C_WH].str.contains("|".join(wh_keywords), case=False, na=False)
-        & ~is_pz_row
-    )
-    is_pz_match = (
-        (work_base[C_WH] == f"ПЗ {current_store}")
-        & (work_base[C_INWORK] == TRUE_VAL)
-    )
+    is_f_match  = (work_base[C_WH].str.contains("|".join(wh_keywords), case=False, na=False) & ~is_pz_row)
+    is_pz_match = ((work_base[C_WH] == f"ПЗ {current_store}") & (work_base[C_INWORK] == TRUE_VAL))
 
     display_df = work_base[
-        (
-            (is_f_match | is_pz_match)
-            & (work_base[C_MOVE] != TRUE_VAL)
-        )
-        | (
-            (work_base[C_MOVE] == TRUE_VAL)
-            & (work_base["_target_store"] == current_store)
-        )
+        ((is_f_match | is_pz_match) & (work_base[C_MOVE] != TRUE_VAL))
+        | ((work_base[C_MOVE] == TRUE_VAL) & (work_base["_target_store"] == current_store))
     ].copy()
 
     display_df = display_df[
         (display_df[C_DONE] != TRUE_VAL)
-        | (
-            (display_df[C_DONE] == TRUE_VAL)
-            & (display_df[C_EDIT] != "")
-            & (~display_df[C_ORDER].isin(st.session_state.reviewed_changes))
-        )
+        | ((display_df[C_DONE] == TRUE_VAL) & (display_df[C_EDIT] != "") & (~display_df[C_ORDER].isin(st.session_state.reviewed_changes)))
     ]
 
     col1, col2 = st.columns(2)
-
-    # ── Новые / Изменения
     with col1:
         st.subheader("🆕 Новые / Изменения")
         new_items = display_df[~display_df[C_ORDER].isin(st.session_state.local_in_work)]
@@ -325,14 +307,9 @@ def render_store(current_store: str) -> None:
                 is_pz_item  = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
                 has_edit    = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
 
-                tag = (
-                    (" ⚠️ ПРАВКА" if has_edit    else "")
-                    + (" ⏳ ПЗ"    if is_pz_item  else "")
-                    + (" 🚚 ЕДЕТ"  if is_incoming else "")
-                )
+                tag = ((" ⚠️ ПРАВКА" if has_edit else "") + (" ⏳ ПЗ" if is_pz_item else "") + (" 🚚 ЕДЕТ" if is_incoming else ""))
                 with st.expander(f"Заказ №{oid}{tag}"):
-                    if has_edit:
-                        st.error(f"Правка: {group[C_EDIT].iloc[0]}")
+                    if has_edit: st.error(f"Правка: {group[C_EDIT].iloc[0]}")
                     render_order_table(group, TABLE_COLS, COL_RENAME)
                     if has_edit:
                         if st.button("Учесть правку", key=f"rev_n_{oid}"):
@@ -345,7 +322,6 @@ def render_store(current_store: str) -> None:
                             save_persistent_state()
                             st.rerun()
 
-    # ── В сборке
     with col2:
         st.subheader("🛠 В сборке")
         in_work = display_df[display_df[C_ORDER].isin(st.session_state.local_in_work)]
@@ -358,8 +334,7 @@ def render_store(current_store: str) -> None:
                 has_edit    = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
 
                 with st.expander(f"Заказ №{oid}{' ⚠️ ПРАВКА' if has_edit else ''}"):
-                    if has_edit:
-                        st.error(f"Правка: {group[C_EDIT].iloc[0]}")
+                    if has_edit: st.error(f"Правка: {group[C_EDIT].iloc[0]}")
                     render_order_table(group, TABLE_COLS, COL_RENAME)
                     if has_edit:
                         if st.button("Учесть правку", key=f"rev_w_{oid}"):
@@ -382,7 +357,6 @@ def render_store(current_store: str) -> None:
                                 save_persistent_state()
                                 st.rerun()
 
-
 # ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
 if "Магазин" in menu:
     current_store = "Горбушка" if "ГОРБУШКА" in menu else "Пекин"
@@ -403,11 +377,7 @@ elif menu == "🚚 Перемещения (Активные)":
 
 elif menu == "⏳ Товар Под заказ":
     st.title("⏳ Ожидание ПЗ")
-    pz = work_base[
-        work_base[C_WH].isin(PZ_LIST)
-        & (work_base[C_INWORK] != TRUE_VAL)
-        & (work_base[C_DONE] != TRUE_VAL)
-    ]
+    pz = work_base[work_base[C_WH].isin(PZ_LIST) & (work_base[C_INWORK] != TRUE_VAL) & (work_base[C_DONE] != TRUE_VAL)]
     st.dataframe(pz[TABLE_COLS].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
 
 elif menu == "✅ Выполненные сборки":
@@ -417,8 +387,4 @@ elif menu == "✅ Выполненные сборки":
 
 elif menu == "🚫 Отмененные заказы":
     st.title("🚫 Отмененные")
-    st.dataframe(
-        canceled_df[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(canceled_df[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
