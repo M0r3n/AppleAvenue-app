@@ -21,65 +21,68 @@ FALSE_VAL    = "FALSE"
 # ── НАСТРОЙКА СТРАНИЦЫ ───────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
 
-# Инициализируем менеджер куки (без кэша!)
-cookie_manager = stx.CookieManager(key="avenue_auth_manager_v2")
+# Инициализируем менеджер куки
+cookie_manager = stx.CookieManager(key="avenue_auth_manager_v3")
 
 def check_password() -> bool:
-    """Проверяет пароль или наличие валидной куки с задержкой на чтение."""
-    # 1. Если уже авторизован в текущей сессии (в ОЗУ)
+    """Проверяет пароль или наличие куки с защитой от зависания интерфейса."""
+    
+    # 1. Если уже авторизован в текущей сессии (оперативка)
     if st.session_state.get("password_correct"):
         return True
 
-    # 2. Даем компоненту время связаться с браузером (0.5 сек достаточно)
-    time.sleep(0.5)
+    # 2. Попытка получить куки из браузера
+    # Даем небольшую паузу при первом входе для инициализации JS
     all_cookies = cookie_manager.get_all()
     
-    # Если куки еще не подгрузились (компонент возвращает None в первую секунду)
     if all_cookies is None:
-        st.info("🔄 Проверка авторизации на устройстве...")
-        st.stop()
+        time.sleep(0.8)
+        all_cookies = cookie_manager.get_all()
 
-    # Извлекаем статус. Приводим к строке для надежности
-    auth_status = all_cookies.get("avenue_auth_status")
-    
-    if str(auth_status) == "authorized":
+    # Проверяем значение куки
+    if all_cookies and str(all_cookies.get("avenue_auth_status")) == "authorized":
         st.session_state.password_correct = True
         return True
 
-    # 3. Форма входа, если куки нет
+    # 3. Форма входа
     st.title("🔐 Вход в систему")
     
     if "password" not in st.secrets:
         st.error("Критическая ошибка: Пароль не настроен в Secrets.")
         st.stop()
 
-    pwd = st.text_input("Введите код доступа:", type="password", key="login_pwd_input")
+    pwd = st.text_input("Введите код доступа:", type="password", key="login_input")
     remember_me = st.checkbox("Запомнить меня на этом устройстве", value=True)
     
-    if st.button("Войти", key="login_submit_btn"):
+    if st.button("Войти", key="login_btn", type="primary"):
         if pwd == st.secrets["password"]:
-            if remember_me:
-                # Записываем куку на 30 дней
-                cookie_manager.set(
-                    "avenue_auth_status", 
-                    "authorized", 
-                    expires_at=datetime.now() + timedelta(days=30),
-                    key="save_auth_cookie_action"
-                )
-                # Ждем 1 секунду, чтобы браузер успел физически сохранить файл
-                time.sleep(1.0)
-            
+            # Сначала пускаем пользователя в сессию
             st.session_state.password_correct = True
+            
+            if remember_me:
+                with st.spinner("Запоминаем устройство..."):
+                    # Сохраняем куку в браузере
+                    cookie_manager.set(
+                        "avenue_auth_status", 
+                        "authorized", 
+                        expires_at=datetime.now() + timedelta(days=30),
+                        key="save_cookie_op"
+                    )
+                    # КРИТИЧНО: Пауза, чтобы JS успел отправить куку в браузер
+                    time.sleep(1.2)
+            
+            # Принудительная перезагрузка для входа в основной интерфейс
             st.rerun()
         else:
             st.error("❌ Неверный код")
+            
     return False
 
-# Запуск проверки пароля
+# Если проверка не прошла — останавливаем выполнение здесь
 if not check_password():
     st.stop()
 
-# ── ДАЛЬНЕЙШАЯ ЛОГИКА ПРИЛОЖЕНИЯ (ТОЛЬКО ДЛЯ АВТОРИЗОВАННЫХ) ──────────────────
+# ── ДАЛЬНЕЙШАЯ ЛОГИКА ПРИЛОЖЕНИЯ (ВЫПОЛНЯЕТСЯ ПОСЛЕ ВХОДА) ────────────────────
 
 def load_persistent_state() -> tuple[set, set]:
     if os.path.exists(DB_FILE):
@@ -158,8 +161,7 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
          and not any("ячейку" in str(c) for c in row)),
         -1,
     )
-    if header_idx == -1:
-        return pd.DataFrame(), {}
+    if header_idx == -1: return pd.DataFrame(), {}
 
     headers = [str(h).strip().replace("\n", " ") for h in raw_data[header_idx]]
 
@@ -182,13 +184,11 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
             "STATUS":  col_idx("Статус") if "Статус" in headers else len(headers) - 1,
         }
     except ValueError as e:
-        st.error(str(e))
-        return pd.DataFrame(), {}
+        st.error(str(e)); return pd.DataFrame(), {}
 
     df = pd.DataFrame(raw_data[START_ROW - 1:], columns=headers)
     df["_sheet_row"] = range(START_ROW, START_ROW + len(df))
     df = df[df[headers[col_map["PRODUCT"]]].str.strip() != ""].copy()
-
     st.session_state.last_sync = datetime.now().strftime("%H:%M:%S")
     return df, col_map
 
@@ -219,16 +219,8 @@ if df_mem.empty or not C:
     st.stop()
 
 cols = df_mem.columns
-C_ORDER   = cols[C["ORDER"]]
-C_PRODUCT = cols[C["PRODUCT"]]
-C_QTY     = cols[C["QTY"]]
-C_WH      = cols[C["WH"]]
-C_COMMENT = cols[C["COMMENT"]]
-C_DONE    = cols[C["DONE"]]
-C_MOVE    = cols[C["MOVE"]]
-C_STATUS  = cols[C["STATUS"]]
-C_EDIT    = cols[C["EDIT"]]
-C_INWORK  = cols[C["INWORK"]]
+C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT = cols[C["ORDER"]], cols[C["PRODUCT"]], cols[C["QTY"]], cols[C["WH"]], cols[C["COMMENT"]]
+C_DONE, C_MOVE, C_STATUS, C_EDIT, C_INWORK = cols[C["DONE"]], cols[C["MOVE"]], cols[C["STATUS"]], cols[C["EDIT"]], cols[C["INWORK"]]
 
 TABLE_COLS = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT]
 COL_RENAME = {C_ORDER: "Заказ", C_PRODUCT: "Товар", C_QTY: "Кол", C_WH: "Склад", C_COMMENT: "Коммент"}
@@ -237,8 +229,7 @@ current_order_ids = set(df_mem[C_ORDER].unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
     if new_ids: st.session_state.new_orders_alert = new_ids
-if current_order_ids != st.session_state.prev_order_ids:
-    st.session_state.prev_order_ids = current_order_ids
+st.session_state.prev_order_ids = current_order_ids
 
 is_canceled = df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)
 canceled_df = df_mem[is_canceled].copy()
@@ -263,7 +254,7 @@ if st.sidebar.button("🔃 Обновить вручную"):
     load_data_integrated.clear()
     st.rerun()
 
-# ── РАЗДЕЛ: МАГАЗИН (ОСНОВНОЙ КОНТЕНТ) ───────────────────────────────────────
+# ── РАЗДЕЛ: МАГАЗИН ───────────────────────────────────────────────────────────
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
     store_new_alert = {oid for oid in st.session_state.new_orders_alert if oid in work_base[C_ORDER].values}
@@ -288,9 +279,8 @@ def render_store(current_store: str) -> None:
         if new_items.empty: st.info("Нет новых заказов")
         else:
             for oid, group in new_items.groupby(C_ORDER, sort=False):
-                is_incoming = group[C_MOVE].iloc[0] == TRUE_VAL
-                is_pz_item  = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
-                has_edit    = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
+                is_incoming, is_pz_item = group[C_MOVE].iloc[0] == TRUE_VAL, group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
+                has_edit = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
                 tag = ((" ⚠️ ПРАВКА" if has_edit else "") + (" ⏳ ПЗ" if is_pz_item else "") + (" 🚚 ЕДЕТ" if is_incoming else ""))
                 with st.expander(f"Заказ №{oid}{tag}"):
                     if has_edit: st.error(f"Правка: {group[C_EDIT].iloc[0]}")
@@ -307,9 +297,7 @@ def render_store(current_store: str) -> None:
         if in_work.empty: st.info("Пока ничего не взято")
         else:
             for oid, group in in_work.groupby(C_ORDER, sort=False):
-                target      = group["_target_store"].iloc[0]
-                is_incoming = group[C_MOVE].iloc[0] == TRUE_VAL
-                has_edit    = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
+                target, is_incoming, has_edit = group["_target_store"].iloc[0], group[C_MOVE].iloc[0] == TRUE_VAL, (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
                 with st.expander(f"Заказ №{oid}{' ⚠️ ПРАВКА' if has_edit else ''}"):
                     if has_edit: st.error(f"Правка: {group[C_EDIT].iloc[0]}")
                     render_order_table(group, TABLE_COLS, COL_RENAME)
@@ -318,20 +306,15 @@ def render_store(current_store: str) -> None:
                             st.session_state.reviewed_changes.add(oid); save_persistent_state(); st.rerun()
                     elif target != current_store and target != "Общий" and not is_incoming:
                         if st.button("🚛 Отправить перемещение", key=f"mv_{oid}"):
-                            update_google_cells(group, C, {"MOVE": TRUE_VAL})
-                            st.session_state.local_in_work.discard(oid); save_persistent_state(); st.rerun()
+                            update_google_cells(group, C, {"MOVE": TRUE_VAL}); st.session_state.local_in_work.discard(oid); save_persistent_state(); st.rerun()
                     else:
                         btn_label = "✅ Принято и собрано" if is_incoming else "✅ Завершить сборку"
                         if st.button(btn_label, key=f"dn_{oid}", type="primary"):
-                            update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
-                            st.session_state.local_in_work.discard(oid)
-                            st.session_state.reviewed_changes.discard(oid)
-                            save_persistent_state(); st.rerun()
+                            update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL}); st.session_state.local_in_work.discard(oid); st.session_state.reviewed_changes.discard(oid); save_persistent_state(); st.rerun()
 
 # ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
 if "Магазин" in menu:
-    current_store = "Горбушка" if "ГОРБУШКА" in menu else "Пекин"
-    render_store(current_store)
+    render_store("Горбушка" if "ГОРБУШКА" in menu else "Пекин")
 elif menu == "🚚 Перемещения (Активные)":
     st.title("🚚 В пути")
     moves = work_base[work_base[C_MOVE] == TRUE_VAL]
