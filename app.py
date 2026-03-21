@@ -333,12 +333,13 @@ def render_store(current_store: str) -> None:
                 with st.expander(f"Заказ №{oid}{tag}"):
                     if has_edit:
                         st.error(f"Правка: {group[C_EDIT].iloc[0]}")
+                    render_order_table(group, TABLE_COLS, COL_RENAME)
+                    if has_edit:
                         if st.button("Учесть правку", key=f"rev_n_{oid}"):
                             st.session_state.reviewed_changes.add(oid)
                             save_persistent_state()
                             st.rerun()
                     else:
-                        render_order_table(group, TABLE_COLS, COL_RENAME)
                         if st.button("В работу", key=f"w_{oid}"):
                             st.session_state.local_in_work.add(oid)
                             save_persistent_state()
@@ -359,12 +360,13 @@ def render_store(current_store: str) -> None:
                 with st.expander(f"Заказ №{oid}{' ⚠️ ПРАВКА' if has_edit else ''}"):
                     if has_edit:
                         st.error(f"Правка: {group[C_EDIT].iloc[0]}")
+                    render_order_table(group, TABLE_COLS, COL_RENAME)
+                    if has_edit:
                         if st.button("Учесть правку", key=f"rev_w_{oid}"):
                             st.session_state.reviewed_changes.add(oid)
                             save_persistent_state()
                             st.rerun()
                     else:
-                        render_order_table(group, TABLE_COLS, COL_RENAME)
                         if target != current_store and target != "Общий" and not is_incoming:
                             if st.button("🚛 Отправить перемещение", key=f"mv_{oid}"):
                                 update_google_cells(group, C, {"MOVE": TRUE_VAL})
