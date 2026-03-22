@@ -214,11 +214,12 @@ refresh_count = st_autorefresh(interval=REFRESH_MS, key="data_refresh")
 
 if "local_in_work" not in st.session_state:
     saved_in_work, saved_reviewed = load_persistent_state()
-    st.session_state.local_in_work    = saved_in_work
-    st.session_state.reviewed_changes = saved_reviewed
-    st.session_state.prev_order_ids   = set()
-    st.session_state.new_orders_alert = set()
-    st.session_state.last_sync        = "Не обновлялось"
+    st.session_state.local_in_work     = saved_in_work
+    st.session_state.reviewed_changes  = saved_reviewed
+    st.session_state.prev_order_ids    = set()
+    st.session_state.new_orders_alert  = set()
+    st.session_state.last_sync         = "Не обновлялось"
+    st.session_state.confirmed_cancels = set()
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 
@@ -384,11 +385,13 @@ def render_store(current_store: str) -> None:
     )
     is_incoming  = is_move & (work_base["_target_store"] == current_store)
 
-    # Отменённые заказы этого магазина — только неподтверждённые (DONE != TRUE)
+    # Отменённые заказы этого магазина — только неподтверждённые (DONE != TRUE и не в confirmed_cancels)
+    _confirmed = st.session_state.get("confirmed_cancels", set())
     is_cancelled_store = (
         work_base["_is_cancelled"]
         & (is_f_match | is_pz_match | is_incoming)
         & (work_base[C_DONE] != TRUE_VAL)
+        & (~work_base[C_ORDER].astype(str).isin(_confirmed))
     )
 
     base_mask    = ((is_f_match | is_pz_match) & ~is_move) | is_incoming
@@ -447,6 +450,8 @@ def render_store(current_store: str) -> None:
                     type="primary", use_container_width=True,
                 ):
                     update_google_cells(group, C, {"DONE": TRUE_VAL})
+                    st.session_state.confirmed_cancels.add(str(oid))
+                    st.session_state.local_in_work.discard(oid)
                     save_persistent_state()
                     st.rerun()
             elif has_edit:
