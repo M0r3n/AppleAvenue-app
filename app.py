@@ -6,6 +6,9 @@
 ИСПРАВЛЕНИЕ: хранение local_in_work и reviewed_changes перенесено
 в Google Sheets (лист avenue_state), чтобы состояние не терялось
 при перезапуске Streamlit Cloud.
+
+ИСПРАВЛЕНИЕ 2: reviewed_changes теперь хранит ключи вида "oid||текст_изменения",
+чтобы повторное изменение в той же графе снова показывалось в интерфейсе.
 """
 
 import streamlit as st
@@ -134,6 +137,7 @@ def load_persistent_state() -> tuple[set, set]:
             return set(), set()
 
         in_work  = {r[0] for r in rows[1:] if r[0].strip()}
+        # reviewed хранит ключи вида "oid||текст_изменения"
         reviewed = {r[1] for r in rows[1:] if len(r) > 1 and r[1].strip()}
         return in_work, reviewed
 
@@ -161,6 +165,16 @@ def save_persistent_state() -> None:
 
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
+
+
+# ── ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: КЛЮЧ ДЛЯ REVIEWED_CHANGES ───────────────────────
+
+def _review_key(oid, edit_text: str) -> str:
+    """
+    Формирует уникальный ключ из номера заказа и текста изменения.
+    При изменении текста ключ меняется — заказ снова становится «непросмотренным».
+    """
+    return f"{oid}||{str(edit_text).strip()}"
 
 
 # ── АВТООБНОВЛЕНИЕ И ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ─────────────────────────────────
@@ -383,7 +397,15 @@ def render_store(current_store: str) -> None:
 
     base_mask = ((is_f_match | is_pz_match) & ~is_move) | is_incoming
     reviewed  = st.session_state.reviewed_changes
-    has_unrev = work_base[C_EDIT].ne("") & ~work_base[C_ORDER].isin(reviewed)
+
+    # has_unrev теперь проверяет по ключу "oid||текст_изменения"
+    def row_has_unreviewed_edit(row) -> bool:
+        edit_text = str(row[C_EDIT]).strip()
+        if not edit_text:
+            return False
+        return _review_key(row[C_ORDER], edit_text) not in reviewed
+
+    has_unrev = work_base.apply(row_has_unreviewed_edit, axis=1)
 
     display_df = work_base[
         base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev)
@@ -400,7 +422,8 @@ def render_store(current_store: str) -> None:
             target         = group["_target_store"].iloc[0]
             incoming       = group[C_MOVE].iloc[0] == TRUE_VAL
             is_pz_item     = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
-            has_edit       = group[C_EDIT].ne("").any() and oid not in reviewed
+            edit_text      = group[C_EDIT].iloc[0]
+            has_edit       = bool(str(edit_text).strip()) and _review_key(oid, edit_text) not in reviewed
             is_move_needed = target != current_store and target != "Общий" and not incoming
 
             tag_str = _build_tags(comment_str, is_move_needed, has_edit, is_pz_item, incoming)
@@ -408,12 +431,12 @@ def render_store(current_store: str) -> None:
 
             with st.expander(label):
                 if has_edit:
-                    st.error(f"Изменение: {group[C_EDIT].iloc[0]}")
+                    st.error(f"Изменение: {edit_text}")
                 render_order_table(group, TABLE_COLS, COL_RENAME)
 
                 if has_edit:
                     if st.button("Учесть Изменение", key=f"rev_n_{oid}"):
-                        st.session_state.reviewed_changes.add(oid)
+                        st.session_state.reviewed_changes.add(_review_key(oid, edit_text))
                         save_persistent_state()
                         st.rerun()
                 else:
@@ -431,7 +454,8 @@ def render_store(current_store: str) -> None:
             target         = group["_target_store"].iloc[0]
             incoming       = group[C_MOVE].iloc[0] == TRUE_VAL
             is_pz_item     = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
-            has_edit       = group[C_EDIT].ne("").any() and oid not in reviewed
+            edit_text      = group[C_EDIT].iloc[0]
+            has_edit       = bool(str(edit_text).strip()) and _review_key(oid, edit_text) not in reviewed
             is_move_needed = target != current_store and target != "Общий" and not incoming
 
             tag_str = _build_tags(
@@ -442,12 +466,12 @@ def render_store(current_store: str) -> None:
 
             with st.expander(label):
                 if has_edit:
-                    st.error(f"Правка: {group[C_EDIT].iloc[0]}")
+                    st.error(f"Правка: {edit_text}")
                 render_order_table(group, TABLE_COLS, COL_RENAME)
 
                 if has_edit:
                     if st.button("Учесть правку", key=f"rev_w_{oid}"):
-                        st.session_state.reviewed_changes.add(oid)
+                        st.session_state.reviewed_changes.add(_review_key(oid, edit_text))
                         save_persistent_state()
                         st.rerun()
                 elif is_move_needed:
@@ -471,7 +495,8 @@ def render_store(current_store: str) -> None:
                     ):
                         update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
                         st.session_state.local_in_work.discard(oid)
-                        st.session_state.reviewed_changes.discard(oid)
+                        # Чистим конкретный ключ текущего изменения
+                        st.session_state.reviewed_changes.discard(_review_key(oid, edit_text))
                         save_persistent_state()
                         st.rerun()
 
