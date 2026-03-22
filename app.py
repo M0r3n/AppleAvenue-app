@@ -1,20 +1,12 @@
 """
-Авеню: Система Заказов — оптимизированная версия
-Изменения: производительность, безопасность, стабильность, читаемость.
-Функционал и интерфейс полностью сохранены.
-
-ИСПРАВЛЕНИЕ: хранение local_in_work и reviewed_changes перенесено
-в Google Sheets (лист avenue_state), чтобы состояние не терялось
-при перезапуске Streamlit Cloud.
-
-ИСПРАВЛЕНИЕ 2: reviewed_changes теперь хранит ключи вида "oid||текст_изменения",
-чтобы повторное изменение в той же графе снова показывалось в интерфейсе.
+Авеню: Система Заказов
+Оптимизированная версия: производительность, безопасность, стабильность.
+Функционал и интерфейс сохранены полностью.
 """
 
 import streamlit as st
 import gspread
 import pandas as pd
-import json
 from datetime import datetime, timedelta
 from typing import Optional
 from streamlit_autorefresh import st_autorefresh
@@ -24,7 +16,7 @@ import extra_streamlit_components as stx
 # ── КОНСТАНТЫ ────────────────────────────────────────────────────────────────
 SHEET_ID       = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
 TAB_NAME       = "Заказы ИМ Авеню"
-STATE_TAB_NAME = "avenue_state"          # ← лист для хранения состояния
+STATE_TAB_NAME = "avenue_state"
 PZ_LIST        = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
 START_ROW      = 26596
 TRUE_VAL       = "TRUE"
@@ -32,14 +24,22 @@ FALSE_VAL      = "FALSE"
 COOKIE_NAME    = "avenue_auth_status"
 COOKIE_VALUE   = "authorized"
 COOKIE_DAYS    = 30
-REFRESH_MS     = 600_000  # 10 минут
+REFRESH_MS     = 600_000
 PREVIEW_ORDERS = 50
+STORE_GORB     = "Горбушка"
+STORE_PEKIN    = "Пекин"
 
-STORE_GORB  = "Горбушка"
-STORE_PEKIN = "Пекин"
+_PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
+_GORB_KEYWORDS  = ("горб", "грб", "gorb")
 
-_PEKIN_KEYWORDS  = ("пек", "пкн", "pekin")
-_GORB_KEYWORDS   = ("горб", "грб", "gorb")
+MENU_OPTIONS = [
+    "🏪 Магазин: ГОРБУШКА",
+    "🏪 Магазин: ПЕКИН",
+    "🚚 Перемещения (Активные)",
+    "⏳ Товар Под заказ",
+    "✅ Выполненные сборки",
+    "🚫 Отмененные заказы",
+]
 
 # ── НАСТРОЙКА СТРАНИЦЫ ───────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
@@ -55,8 +55,8 @@ def check_password() -> bool:
     if st.session_state.get("password_correct"):
         return True
 
-    all_cookies = cookie_manager.get_all()
-    if all_cookies and str(all_cookies.get(COOKIE_NAME)) == COOKIE_VALUE:
+    cookies = cookie_manager.get_all()
+    if cookies and str(cookies.get(COOKIE_NAME)) == COOKIE_VALUE:
         st.session_state.password_correct = True
         return True
 
@@ -74,8 +74,7 @@ def check_password() -> bool:
             st.session_state.password_correct = True
             if remember:
                 cookie_manager.set(
-                    COOKIE_NAME,
-                    COOKIE_VALUE,
+                    COOKIE_NAME, COOKIE_VALUE,
                     expires_at=datetime.now() + timedelta(days=COOKIE_DAYS),
                 )
             st.rerun()
@@ -92,7 +91,7 @@ if not check_password():
 @st.cache_resource
 def get_client() -> gspread.Client:
     try:
-        gs = st.secrets["connections"]["gsheets"]
+        gs    = st.secrets["connections"]["gsheets"]
         creds = Credentials.from_authorized_user_info(
             {
                 "client_id":     gs["client_id"],
@@ -111,73 +110,94 @@ def get_client() -> gspread.Client:
         st.stop()
 
 
-# ── ПОСТОЯННОЕ СОСТОЯНИЕ ЧЕРЕЗ GOOGLE SHEETS ──────────────────────────────────
-# Streamlit Cloud сбрасывает файловую систему при каждом перезапуске,
-# поэтому JSON-файл ненадёжен. Храним состояние в отдельном листе той же таблицы.
+def _get_spreadsheet() -> gspread.Spreadsheet:
+    """Возвращает spreadsheet объект (без лишних открытий)."""
+    return get_client().open_by_key(SHEET_ID)
+
+
+# ── СОСТОЯНИЕ В GOOGLE SHEETS ─────────────────────────────────────────────────
 
 def _get_state_worksheet() -> gspread.Worksheet:
-    """Возвращает лист avenue_state, создаёт его при отсутствии."""
-    client = get_client()
-    spreadsheet = client.open_by_key(SHEET_ID)
+    """Возвращает лист avenue_state, создаёт при отсутствии."""
+    ss = _get_spreadsheet()
     try:
-        return spreadsheet.worksheet(STATE_TAB_NAME)
+        return ss.worksheet(STATE_TAB_NAME)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(STATE_TAB_NAME, rows=5000, cols=2)
+        ws = ss.add_worksheet(STATE_TAB_NAME, rows=5000, cols=2)
         ws.update([["local_in_work", "reviewed_changes"]], value_input_option="RAW")
         return ws
 
 
 def load_persistent_state() -> tuple[set, set]:
-    """Загружает состояние из листа Google Sheets."""
     try:
-        ws   = _get_state_worksheet()
-        rows = ws.get_all_values()   # [[header_col1, header_col2], [val, val], ...]
-
+        rows = _get_state_worksheet().get_all_values()
         if len(rows) < 2:
             return set(), set()
-
         in_work  = {r[0] for r in rows[1:] if r[0].strip()}
-        # reviewed хранит ключи вида "oid||текст_изменения"
         reviewed = {r[1] for r in rows[1:] if len(r) > 1 and r[1].strip()}
         return in_work, reviewed
-
     except Exception as e:
         st.warning(f"Не удалось загрузить состояние из Sheets: {e}")
         return set(), set()
 
 
 def save_persistent_state() -> None:
-    """Сохраняет текущее состояние в лист Google Sheets (полная перезапись)."""
     try:
-        ws = _get_state_worksheet()
-
+        ws       = _get_state_worksheet()
         in_work  = list(st.session_state.local_in_work)
         reviewed = list(st.session_state.reviewed_changes)
-
-        # Выравниваем оба списка до одинаковой длины
-        max_len   = max(len(in_work), len(reviewed), 1)
+        max_len  = max(len(in_work), len(reviewed), 1)
         in_work  += [""] * (max_len - len(in_work))
         reviewed += [""] * (max_len - len(reviewed))
-
-        rows = [["local_in_work", "reviewed_changes"]] + list(zip(in_work, reviewed))
         ws.clear()
-        ws.update(rows, value_input_option="RAW")
-
+        ws.update(
+            [["local_in_work", "reviewed_changes"]] + list(zip(in_work, reviewed)),
+            value_input_option="RAW",
+        )
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
 
 
-# ── ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: КЛЮЧ ДЛЯ REVIEWED_CHANGES ───────────────────────
+# ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
 
 def _review_key(oid, edit_text: str) -> str:
-    """
-    Формирует уникальный ключ из номера заказа и текста изменения.
-    При изменении текста ключ меняется — заказ снова становится «непросмотренным».
-    """
+    """Уникальный ключ: номер заказа + текст изменения."""
     return f"{oid}||{str(edit_text).strip()}"
 
 
-# ── АВТООБНОВЛЕНИЕ И ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ─────────────────────────────────
+def identify_target_store(comment: str) -> str:
+    c = str(comment).lower()
+    if "d" in c:
+        return STORE_GORB
+    if any(k in c for k in _PEKIN_KEYWORDS):
+        return STORE_PEKIN
+    if any(k in c for k in _GORB_KEYWORDS):
+        return STORE_GORB
+    return "Общий"
+
+
+def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
+    st.table(group[table_cols].rename(columns=col_rename))
+
+
+def _build_tags(
+    comment_str: str,
+    is_move_needed: bool,
+    has_edit: bool,
+    is_pz_item: bool,
+    incoming: bool,
+    extra_tag: Optional[str] = None,
+) -> str:
+    tags = []
+    if "d" in comment_str:  tags.append("📦 ДОСТАВКА")
+    if is_move_needed:       tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+    if has_edit:             tags.append("⚠️ ИЗМЕНЕНИЕ" if not extra_tag else extra_tag)
+    if is_pz_item:           tags.append("⏳ ПЗ")
+    if incoming:             tags.append("🚚 ЕДЕТ")
+    return " | ".join(tags)
+
+
+# ── АВТООБНОВЛЕНИЕ И ИНИЦИАЛИЗАЦИЯ ───────────────────────────────────────────
 refresh_count = st_autorefresh(interval=REFRESH_MS, key="data_refresh")
 
 if "local_in_work" not in st.session_state:
@@ -188,21 +208,14 @@ if "local_in_work" not in st.session_state:
     st.session_state.new_orders_alert = set()
     st.session_state.last_sync        = "Не обновлялось"
 
-# ── GOOGLE SHEETS DATA ────────────────────────────────────────────────────────
-
-def get_worksheet() -> gspread.Worksheet:
-    client = get_client()
-    spreadsheet = client.open_by_key(SHEET_ID)
-    try:
-        return spreadsheet.worksheet(TAB_NAME)
-    except gspread.WorksheetNotFound:
-        return spreadsheet.get_worksheet(0)
-
+# ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
 def load_data_integrated() -> tuple[pd.DataFrame, dict]:
-    sheet    = get_worksheet()
+    ss       = get_client().open_by_key(SHEET_ID)
+    sheet    = ss.worksheet(TAB_NAME) if TAB_NAME else ss.get_worksheet(0)
     raw_data = sheet.get_all_values()
+
     if not raw_data:
         return pd.DataFrame(), {}
 
@@ -222,6 +235,9 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
         except ValueError:
             raise ValueError(f"Колонка «{name}» не найдена в заголовке таблицы.")
 
+    # "Статус" может отсутствовать — берём последнюю колонку как запасной вариант
+    status_idx = headers.index("Статус") if "Статус" in headers else len(headers) - 1
+
     col_map = {
         "ORDER":   col_idx("Наименование") - 1,
         "PRODUCT": col_idx("Наименование"),
@@ -232,11 +248,10 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
         "INWORK":  col_idx("Под ЗАКАЗ"),
         "MOVE":    col_idx("Перемещение"),
         "DONE":    col_idx("Собрано"),
-        "STATUS":  col_idx("Статус") if "Статус" in headers else len(headers) - 1,
+        "STATUS":  status_idx,
     }
 
-    data_rows = raw_data[START_ROW - 1:]
-    df = pd.DataFrame(data_rows, columns=headers)
+    df = pd.DataFrame(raw_data[START_ROW - 1:], columns=headers)
     df["_sheet_row"] = range(START_ROW, START_ROW + len(df))
 
     product_col = headers[col_map["PRODUCT"]]
@@ -249,36 +264,26 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
 if refresh_count > 0:
     load_data_integrated.clear()
 
-# ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
+
+def get_worksheet() -> gspread.Worksheet:
+    """Открывает рабочий лист заказов."""
+    ss = _get_spreadsheet()
+    try:
+        return ss.worksheet(TAB_NAME)
+    except gspread.WorksheetNotFound:
+        return ss.get_worksheet(0)
+
 
 def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> None:
-    sheet = get_worksheet()
-
+    sheet     = get_worksheet()
     cell_list = [
         gspread.Cell(row=int(row_num), col=col_map[key] + 1, value=val)
         for key, val in updates.items()
         for row_num in group["_sheet_row"]
     ]
-
     if cell_list:
         sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
-
     load_data_integrated.clear()
-
-
-def identify_target_store(comment: str) -> str:
-    c = str(comment).lower()
-    if "d" in c:
-        return STORE_GORB
-    if any(k in c for k in _PEKIN_KEYWORDS):
-        return STORE_PEKIN
-    if any(k in c for k in _GORB_KEYWORDS):
-        return STORE_GORB
-    return "Общий"
-
-
-def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
-    st.table(group[table_cols].rename(columns=col_rename))
 
 
 # ── ПОДГОТОВКА ДАННЫХ ─────────────────────────────────────────────────────────
@@ -288,7 +293,7 @@ if df_mem.empty or not C:
     st.error("Не удалось загрузить данные. Проверьте таблицу и настройки.")
     st.stop()
 
-cols      = df_mem.columns
+cols = df_mem.columns
 C_ORDER   = cols[C["ORDER"]]
 C_PRODUCT = cols[C["PRODUCT"]]
 C_QTY     = cols[C["QTY"]]
@@ -302,13 +307,12 @@ C_INWORK  = cols[C["INWORK"]]
 
 TABLE_COLS = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT]
 COL_RENAME = {
-    C_ORDER:   "Заказ",
-    C_PRODUCT: "Товар",
-    C_QTY:     "Кол",
-    C_WH:      "Склад",
+    C_ORDER: "Заказ", C_PRODUCT: "Товар",
+    C_QTY:   "Кол",   C_WH:      "Склад",
     C_COMMENT: "Коммент",
 }
 
+# Оповещения о новых заказах
 current_order_ids = set(df_mem[C_ORDER].unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
@@ -316,25 +320,13 @@ if st.session_state.prev_order_ids:
         st.session_state.new_orders_alert = new_ids
 st.session_state.prev_order_ids = current_order_ids
 
-work_base = df_mem[
-    ~df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)
-].copy()
-
+# Базовый фильтр: без отменённых + целевой магазин
+work_base = df_mem[~df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)].copy()
 work_base["_target_store"] = work_base[C_COMMENT].apply(identify_target_store)
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
-menu = st.sidebar.selectbox(
-    "Выберите раздел:",
-    [
-        "🏪 Магазин: ГОРБУШКА",
-        "🏪 Магазин: ПЕКИН",
-        "🚚 Перемещения (Активные)",
-        "⏳ Товар Под заказ",
-        "✅ Выполненные сборки",
-        "🚫 Отмененные заказы",
-    ],
-)
+menu = st.sidebar.selectbox("Выберите раздел:", MENU_OPTIONS)
 
 if st.sidebar.button("🚪 Выйти"):
     cookie_manager.delete(COOKIE_NAME)
@@ -349,23 +341,6 @@ if st.sidebar.button("🔃 Обновить данные сейчас"):
     st.rerun()
 
 # ── ЛОГИКА ОТОБРАЖЕНИЯ МАГАЗИНА ───────────────────────────────────────────────
-
-def _build_tags(
-    comment_str: str,
-    is_move_needed: bool,
-    has_edit: bool,
-    is_pz_item: bool,
-    incoming: bool,
-    extra_tag: Optional[str] = None,
-) -> str:
-    tags = []
-    if "d" in comment_str:    tags.append("📦 ДОСТАВКА")
-    if is_move_needed:         tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
-    if has_edit:               tags.append("⚠️ ИЗМЕНЕНИЕ" if not extra_tag else extra_tag)
-    if is_pz_item:             tags.append("⏳ ПЗ")
-    if incoming:               tags.append("🚚 ЕДЕТ")
-    return " | ".join(tags)
-
 
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
@@ -393,19 +368,20 @@ def render_store(current_store: str) -> None:
         (work_base[C_WH] == f"ПЗ {current_store}")
         & (work_base[C_INWORK] == TRUE_VAL)
     )
-    is_incoming = is_move & (work_base["_target_store"] == current_store)
+    is_incoming  = is_move & (work_base["_target_store"] == current_store)
+    base_mask    = ((is_f_match | is_pz_match) & ~is_move) | is_incoming
+    reviewed     = st.session_state.reviewed_changes
 
-    base_mask = ((is_f_match | is_pz_match) & ~is_move) | is_incoming
-    reviewed  = st.session_state.reviewed_changes
-
-    # has_unrev теперь проверяет по ключу "oid||текст_изменения"
-    def row_has_unreviewed_edit(row) -> bool:
-        edit_text = str(row[C_EDIT]).strip()
-        if not edit_text:
-            return False
-        return _review_key(row[C_ORDER], edit_text) not in reviewed
-
-    has_unrev = work_base.apply(row_has_unreviewed_edit, axis=1)
+    # Строки с непросмотренными изменениями
+    edit_series  = work_base[C_EDIT].fillna("").str.strip()
+    order_series = work_base[C_ORDER]
+    has_unrev    = edit_series.astype(bool) & ~pd.Series(
+        [
+            _review_key(oid, et) in reviewed
+            for oid, et in zip(order_series, edit_series)
+        ],
+        index=work_base.index,
+    )
 
     display_df = work_base[
         base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev)
@@ -413,73 +389,36 @@ def render_store(current_store: str) -> None:
 
     col1, col2 = st.columns(2)
 
-    with col1:
-        st.subheader("🆕 Новые / Изменения")
-        new_items = display_df[~display_df[C_ORDER].isin(st.session_state.local_in_work)]
+    def _render_order_group(oid, group, in_work_section: bool) -> None:
+        comment_str    = str(group[C_COMMENT].iloc[0]).lower()
+        target         = group["_target_store"].iloc[0]
+        incoming       = group[C_MOVE].iloc[0] == TRUE_VAL
+        is_pz_item     = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
+        edit_text      = group[C_EDIT].iloc[0]
+        has_edit       = bool(str(edit_text).strip()) and _review_key(oid, edit_text) not in reviewed
+        is_move_needed = target != current_store and target != "Общий" and not incoming
 
-        for oid, group in new_items.groupby(C_ORDER, sort=False):
-            comment_str    = str(group[C_COMMENT].iloc[0]).lower()
-            target         = group["_target_store"].iloc[0]
-            incoming       = group[C_MOVE].iloc[0] == TRUE_VAL
-            is_pz_item     = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
-            edit_text      = group[C_EDIT].iloc[0]
-            has_edit       = bool(str(edit_text).strip()) and _review_key(oid, edit_text) not in reviewed
-            is_move_needed = target != current_store and target != "Общий" and not incoming
+        extra_tag = "⚠️ ПРАВКА" if in_work_section else None
+        tag_str   = _build_tags(comment_str, is_move_needed, has_edit, is_pz_item, incoming, extra_tag)
+        label     = f"Заказ №{oid}{f' [{tag_str}]' if tag_str else ''}"
 
-            tag_str = _build_tags(comment_str, is_move_needed, has_edit, is_pz_item, incoming)
-            label   = f"Заказ №{oid}{f' [{tag_str}]' if tag_str else ''}"
+        with st.expander(label):
+            if has_edit:
+                prefix = "Правка" if in_work_section else "Изменение"
+                st.error(f"{prefix}: {edit_text}")
+            render_order_table(group, TABLE_COLS, COL_RENAME)
 
-            with st.expander(label):
-                if has_edit:
-                    st.error(f"Изменение: {edit_text}")
-                render_order_table(group, TABLE_COLS, COL_RENAME)
-
-                if has_edit:
-                    if st.button("Учесть Изменение", key=f"rev_n_{oid}"):
-                        st.session_state.reviewed_changes.add(_review_key(oid, edit_text))
-                        save_persistent_state()
-                        st.rerun()
-                else:
-                    if st.button("В работу", key=f"w_{oid}"):
-                        st.session_state.local_in_work.add(oid)
-                        save_persistent_state()
-                        st.rerun()
-
-    with col2:
-        st.subheader("🛠 В сборке")
-        in_work = display_df[display_df[C_ORDER].isin(st.session_state.local_in_work)]
-
-        for oid, group in in_work.groupby(C_ORDER, sort=False):
-            comment_str    = str(group[C_COMMENT].iloc[0]).lower()
-            target         = group["_target_store"].iloc[0]
-            incoming       = group[C_MOVE].iloc[0] == TRUE_VAL
-            is_pz_item     = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
-            edit_text      = group[C_EDIT].iloc[0]
-            has_edit       = bool(str(edit_text).strip()) and _review_key(oid, edit_text) not in reviewed
-            is_move_needed = target != current_store and target != "Общий" and not incoming
-
-            tag_str = _build_tags(
-                comment_str, is_move_needed, has_edit, is_pz_item, incoming,
-                extra_tag="⚠️ ПРАВКА",
-            )
-            label = f"Заказ №{oid}{f' [{tag_str}]' if tag_str else ''}"
-
-            with st.expander(label):
-                if has_edit:
-                    st.error(f"Правка: {edit_text}")
-                render_order_table(group, TABLE_COLS, COL_RENAME)
-
-                if has_edit:
-                    if st.button("Учесть правку", key=f"rev_w_{oid}"):
-                        st.session_state.reviewed_changes.add(_review_key(oid, edit_text))
-                        save_persistent_state()
-                        st.rerun()
-                elif is_move_needed:
+            if has_edit:
+                btn_label = "Учесть правку" if in_work_section else "Учесть Изменение"
+                if st.button(btn_label, key=f"rev_{'w' if in_work_section else 'n'}_{oid}"):
+                    st.session_state.reviewed_changes.add(_review_key(oid, edit_text))
+                    save_persistent_state()
+                    st.rerun()
+            elif in_work_section:
+                if is_move_needed:
                     if st.button(
-                        "🚛 ОТПРАВИТЬ ПЕРЕМЕЩЕНИЕ",
-                        key=f"mv_{oid}",
-                        type="primary",
-                        use_container_width=True,
+                        "🚛 ОТПРАВИТЬ ПЕРЕМЕЩЕНИЕ", key=f"mv_{oid}",
+                        type="primary", use_container_width=True,
                     ):
                         update_google_cells(group, C, {"MOVE": TRUE_VAL})
                         st.session_state.local_in_work.discard(oid)
@@ -488,17 +427,31 @@ def render_store(current_store: str) -> None:
                 else:
                     action_label = "✅ ПРИНЯТО И СОБРАНО" if incoming else "✅ ЗАВЕРШИТЬ СБОРКУ"
                     if st.button(
-                        action_label,
-                        key=f"dn_{oid}",
-                        type="primary",
-                        use_container_width=True,
+                        action_label, key=f"dn_{oid}",
+                        type="primary", use_container_width=True,
                     ):
                         update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
                         st.session_state.local_in_work.discard(oid)
-                        # Чистим конкретный ключ текущего изменения
                         st.session_state.reviewed_changes.discard(_review_key(oid, edit_text))
                         save_persistent_state()
                         st.rerun()
+            else:
+                if st.button("В работу", key=f"w_{oid}"):
+                    st.session_state.local_in_work.add(oid)
+                    save_persistent_state()
+                    st.rerun()
+
+    with col1:
+        st.subheader("🆕 Новые / Изменения")
+        new_items = display_df[~display_df[C_ORDER].isin(st.session_state.local_in_work)]
+        for oid, group in new_items.groupby(C_ORDER, sort=False):
+            _render_order_group(oid, group, in_work_section=False)
+
+    with col2:
+        st.subheader("🛠 В сборке")
+        in_work = display_df[display_df[C_ORDER].isin(st.session_state.local_in_work)]
+        for oid, group in in_work.groupby(C_ORDER, sort=False):
+            _render_order_group(oid, group, in_work_section=True)
 
 
 # ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
@@ -525,8 +478,7 @@ elif menu == "⏳ Товар Под заказ":
     ]
     st.dataframe(
         pz[TABLE_COLS].rename(columns=COL_RENAME),
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
     )
 
 elif menu == "✅ Выполненные сборки":
@@ -534,17 +486,13 @@ elif menu == "✅ Выполненные сборки":
     done = work_base[work_base[C_DONE] == TRUE_VAL].iloc[::-1].head(PREVIEW_ORDERS)
     st.dataframe(
         done[TABLE_COLS].rename(columns=COL_RENAME),
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
     )
 
 elif menu == "🚫 Отмененные заказы":
     st.title("🚫 Отмененные")
-    cancelled = df_mem[
-        df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)
-    ]
+    cancelled = df_mem[df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)]
     st.dataframe(
         cancelled[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME),
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
     )
