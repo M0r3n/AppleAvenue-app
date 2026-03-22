@@ -22,7 +22,7 @@ COOKIE_NAME    = "avenue_auth_status"
 COOKIE_VALUE   = "authorized"
 COOKIE_DAYS    = 30
 REFRESH_MS     = 600_000  # 10 минут
-PREVIEW_ORDERS = 50       # кол-во заказов в «Выполненных»
+PREVIEW_ORDERS = 50        # кол-во заказов в «Выполненных»
 
 # ── НАСТРОЙКА СТРАНИЦЫ ───────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
@@ -173,7 +173,6 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
 
 def identify_target_store(comment: str) -> str:
     c = str(comment).lower()
-    # Если в комменте есть "d" — это доставка, относится к Горбушке
     if "d" in c:
         return "Горбушка"
     if any(k in c for k in ["пек", "пкн", "pekin"]): return "Пекин"
@@ -182,6 +181,18 @@ def identify_target_store(comment: str) -> str:
 
 def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
     st.table(group[table_cols].rename(columns=col_rename))
+
+def get_warehouse_tags(group: pd.DataFrame) -> str:
+    """Генерирует плашки складов для заголовка заказа."""
+    all_whs = " ".join(group[C_WH].fillna("").astype(str)).lower()
+    tags = []
+    if "сток" in all_whs:
+        tags.append("🟦 С")
+    if "горб" in all_whs:
+        tags.append("🟪 Г")
+    if "пекин" in all_whs:
+        tags.append("🟩 П")
+    return "  ".join(tags)
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 df_mem, C = load_data_integrated()
@@ -223,12 +234,10 @@ if st.sidebar.button("🔃 Обновить вручную"):
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
 
-    # Учет новых заказов (алерты)
     store_new_alert = {oid for oid in st.session_state.new_orders_alert if oid in work_base[C_ORDER].values}
     if store_new_alert:
         st.success(f"🆕 Новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
     
-    # Фильтр складов (Горбушка + СТОК как одно целое)
     if current_store == "Горбушка":
         wh_match = work_base[C_WH].str.contains("Горб|Сток", case=False, na=False)
     else:
@@ -236,7 +245,6 @@ def render_store(current_store: str) -> None:
 
     is_pz_row = work_base[C_WH].isin(PZ_LIST)
     is_f_match = wh_match & ~is_pz_row
-    # Товар в ПЗ считается готовым к выдаче/сборке, если стоит галка "Под ЗАКАЗ" (INWORK)
     is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & (work_base[C_INWORK] == TRUE_VAL)
     is_move = work_base[C_MOVE] == TRUE_VAL
     is_incoming = is_move & (work_base["_target_store"] == current_store)
@@ -255,8 +263,6 @@ def render_store(current_store: str) -> None:
             incoming = group[C_MOVE].iloc[0] == TRUE_VAL
             is_pz_item = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
             has_edit = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
-            
-            # Если склад СТОК, а цель Пекин — помечаем как перемещение
             is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
             tags = []
@@ -266,11 +272,13 @@ def render_store(current_store: str) -> None:
             if is_pz_item: tags.append("⏳ ПЗ")
             if incoming: tags.append("🚚 ЕДЕТ")
             
+            wh_tags = get_warehouse_tags(group)
             tag_str = " | ".join(tags)
-            with st.expander(f"Заказ №{oid}{f' [{tag_str}]' if tags else ''}"):
+            header_label = f"Заказ №{oid}{f' [{tag_str}]' if tags else ''} \u2001 {wh_tags}"
+            
+            with st.expander(header_label):
                 if has_edit: st.error(f"Изменение: {group[C_EDIT].iloc[0]}")
                 render_order_table(group, TABLE_COLS, COL_RENAME)
-                
                 if has_edit:
                     if st.button("Учесть Изменение", key=f"rev_n_{oid}"):
                         st.session_state.reviewed_changes.add(oid)
@@ -299,11 +307,13 @@ def render_store(current_store: str) -> None:
             if has_edit: tags.append("⚠️ ПРАВКА")
             if is_pz_item: tags.append("⏳ ПЗ")
             
+            wh_tags = get_warehouse_tags(group)
             tag_str = " | ".join(tags)
-            with st.expander(f"Заказ №{oid}{f' [{tag_str}]' if tags else ''}"):
+            header_label = f"Заказ №{oid}{f' [{tag_str}]' if tags else ''} \u2001 {wh_tags}"
+            
+            with st.expander(header_label):
                 if has_edit: st.error(f"Правка: {group[C_EDIT].iloc[0]}")
                 render_order_table(group, TABLE_COLS, COL_RENAME)
-                
                 if has_edit:
                     if st.button("Учесть правку", key=f"rev_w_{oid}"):
                         st.session_state.reviewed_changes.add(oid)
@@ -331,7 +341,8 @@ elif menu == "🚚 Перемещения (Активные)":
     st.title("🚚 В пути")
     moves = work_base[work_base[C_MOVE] == TRUE_VAL]
     for oid, group in moves.groupby(C_ORDER, sort=False):
-        with st.expander(f"Перемещение №{oid}"):
+        wh_tags = get_warehouse_tags(group)
+        with st.expander(f"Перемещение №{oid} \u2001 {wh_tags}"):
             render_order_table(group, TABLE_COLS, COL_RENAME)
             if st.button("Удалить из списка", key=f"cl_mv_{oid}"):
                 update_google_cells(group, C, {"MOVE": FALSE_VAL})
