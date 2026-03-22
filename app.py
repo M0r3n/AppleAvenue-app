@@ -438,8 +438,13 @@ def render_store(current_store: str) -> None:
             render_order_table(group, TABLE_COLS, COL_RENAME)
 
             if cancelled:
-                # Для отменённых — никаких кнопок действий, заказ уже в финальном статусе
-                st.caption("Заказ перемещён в раздел «Отменённые заказы»")
+                if st.button(
+                    "✅ Подтвердить отмену", key=f"confirm_cancel_{oid}",
+                    type="primary", use_container_width=True,
+                ):
+                    update_google_cells(group, C, {"DONE": TRUE_VAL})
+                    save_persistent_state()
+                    st.rerun()
             elif has_edit:
                 btn_label = "Учесть правку" if in_work_section else "Учесть Изменение"
                 if st.button(btn_label, key=f"rev_{'w' if in_work_section else 'n'}_{oid}"):
