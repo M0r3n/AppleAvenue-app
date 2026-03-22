@@ -182,17 +182,17 @@ def identify_target_store(comment: str) -> str:
 def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
     st.table(group[table_cols].rename(columns=col_rename))
 
-def get_warehouse_tags(group: pd.DataFrame) -> str:
-    """Генерирует плашки складов для заголовка заказа."""
+def get_warehouse_squares(group: pd.DataFrame) -> str:
+    """Генерирует только цветные квадраты складов для заголовка."""
     all_whs = " ".join(group[C_WH].fillna("").astype(str)).lower()
-    tags = []
+    squares = []
     if "сток" in all_whs:
-        tags.append("🟦 С")
+        squares.append("🟦")
     if "горб" in all_whs:
-        tags.append("🟪 Г")
+        squares.append("🟪")
     if "пекин" in all_whs:
-        tags.append("🟩 П")
-    return "  ".join(tags)
+        squares.append("🟩")
+    return "".join(squares)
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 df_mem, C = load_data_integrated()
@@ -254,6 +254,14 @@ def render_store(current_store: str) -> None:
 
     col1, col2 = st.columns(2)
 
+    # Функция сборки заголовка с выравниванием вправо
+    def get_header_label(oid, tags_list, squares):
+        tag_str = f" | {' | '.join(tags_list)}" if tags_list else ""
+        # Используем большое количество пробелов (\u00A0) для имитации выравнивания вправо
+        # В Streamlit expander это самый надежный способ без кастомного CSS
+        spacer = "\u00A0" * 40 
+        return f"Заказ №{oid}{tag_str} {spacer} {squares}"
+
     with col1:
         st.subheader("🆕 Новые / Изменения")
         new_items = display_df[~display_df[C_ORDER].isin(st.session_state.local_in_work)]
@@ -266,15 +274,14 @@ def render_store(current_store: str) -> None:
             is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
             tags = []
-            if "d" in comment_str: tags.append("📦 ДОСТАВКА")
-            if is_move_needed: tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
-            if has_edit: tags.append("⚠️ ИЗМЕНЕНИЕ")
+            if "d" in comment_str: tags.append("📦 ДОСТ")
+            if is_move_needed: tags.append("🚚 ПЕРЕМ")
+            if has_edit: tags.append("⚠️ ИЗМ")
             if is_pz_item: tags.append("⏳ ПЗ")
             if incoming: tags.append("🚚 ЕДЕТ")
             
-            wh_tags = get_warehouse_tags(group)
-            tag_str = " | ".join(tags)
-            header_label = f"Заказ №{oid}{f' [{tag_str}]' if tags else ''} \u2001 {wh_tags}"
+            squares = get_warehouse_squares(group)
+            header_label = get_header_label(oid, tags, squares)
             
             with st.expander(header_label):
                 if has_edit: st.error(f"Изменение: {group[C_EDIT].iloc[0]}")
@@ -302,14 +309,13 @@ def render_store(current_store: str) -> None:
             is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
             tags = []
-            if "d" in comment_str: tags.append("📦 ДОСТАВКА")
-            if is_move_needed: tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+            if "d" in comment_str: tags.append("📦 ДОСТ")
+            if is_move_needed: tags.append("🚚 ПЕРЕМ")
             if has_edit: tags.append("⚠️ ПРАВКА")
             if is_pz_item: tags.append("⏳ ПЗ")
             
-            wh_tags = get_warehouse_tags(group)
-            tag_str = " | ".join(tags)
-            header_label = f"Заказ №{oid}{f' [{tag_str}]' if tags else ''} \u2001 {wh_tags}"
+            squares = get_warehouse_squares(group)
+            header_label = get_header_label(oid, tags, squares)
             
             with st.expander(header_label):
                 if has_edit: st.error(f"Правка: {group[C_EDIT].iloc[0]}")
@@ -341,8 +347,9 @@ elif menu == "🚚 Перемещения (Активные)":
     st.title("🚚 В пути")
     moves = work_base[work_base[C_MOVE] == TRUE_VAL]
     for oid, group in moves.groupby(C_ORDER, sort=False):
-        wh_tags = get_warehouse_tags(group)
-        with st.expander(f"Перемещение №{oid} \u2001 {wh_tags}"):
+        squares = get_warehouse_squares(group)
+        spacer = "\u00A0" * 40
+        with st.expander(f"Перемещение №{oid} {spacer} {squares}"):
             render_order_table(group, TABLE_COLS, COL_RENAME)
             if st.button("Удалить из списка", key=f"cl_mv_{oid}"):
                 update_google_cells(group, C, {"MOVE": FALSE_VAL})
