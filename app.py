@@ -219,8 +219,13 @@ if st.sidebar.button("🔃 Обновить вручную"):
 
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
+
+    # Учет новых заказов (алерты)
+    store_new_alert = {oid for oid in st.session_state.new_orders_alert if oid in work_base[C_ORDER].values}
+    if store_new_alert:
+        st.success(f"🆕 Новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
     
-    # Фильтр "своего" склада: Сток и Горбушка — в одну кучу
+    # Фильтр складов (Горбушка + СТОК как одно целое)
     if current_store == "Горбушка":
         wh_match = work_base[C_WH].str.contains("Горб|Сток", case=False, na=False)
     else:
@@ -228,6 +233,7 @@ def render_store(current_store: str) -> None:
 
     is_pz_row = work_base[C_WH].isin(PZ_LIST)
     is_f_match = wh_match & ~is_pz_row
+    # Товар в ПЗ считается готовым к выдаче/сборке, если стоит галка "Под ЗАКАЗ" (INWORK)
     is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & (work_base[C_INWORK] == TRUE_VAL)
     is_move = work_base[C_MOVE] == TRUE_VAL
     is_incoming = is_move & (work_base["_target_store"] == current_store)
@@ -242,21 +248,34 @@ def render_store(current_store: str) -> None:
         new_items = display_df[~display_df[C_ORDER].isin(st.session_state.local_in_work)]
         for oid, group in new_items.groupby(C_ORDER, sort=False):
             target = group["_target_store"].iloc[0]
-            # ЯРКАЯ ПЛАШКА ПЕРЕМЕЩЕНИЯ
-            is_move_needed = (target != current_store and target != "Общий" and group[C_MOVE].iloc[0] != TRUE_VAL)
+            incoming = group[C_MOVE].iloc[0] == TRUE_VAL
+            is_pz_item = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
             has_edit = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
             
-            tag = ""
-            if is_move_needed: tag += " 🚚 ПЕРЕМЕЩЕНИЕ"
-            if has_edit: tag += " ⚠️ ПРАВКА"
+            # Если склад СТОК, а цель Пекин — помечаем как перемещение
+            is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
-            with st.expander(f"Заказ №{oid}{tag}"):
+            tags = []
+            if is_move_needed: tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+            if has_edit: tags.append("⚠️ ИЗМЕНЕНИЕ")
+            if is_pz_item: tags.append("⏳ ПЗ")
+            if incoming: tags.append("🚚 ЕДЕТ")
+            
+            tag_str = " | ".join(tags)
+            with st.expander(f"Заказ №{oid}{f' [{tag_str}]' if tags else ''}"):
                 if has_edit: st.error(f"Изменение: {group[C_EDIT].iloc[0]}")
                 render_order_table(group, TABLE_COLS, COL_RENAME)
-                if st.button("В работу", key=f"w_{oid}"):
-                    st.session_state.local_in_work.add(oid)
-                    save_persistent_state()
-                    st.rerun()
+                
+                if has_edit:
+                    if st.button("Учесть Изменение", key=f"rev_n_{oid}"):
+                        st.session_state.reviewed_changes.add(oid)
+                        save_persistent_state()
+                        st.rerun()
+                else:
+                    if st.button("В работу", key=f"w_{oid}"):
+                        st.session_state.local_in_work.add(oid)
+                        save_persistent_state()
+                        st.rerun()
 
     with col2:
         st.subheader("🛠 В сборке")
@@ -264,12 +283,26 @@ def render_store(current_store: str) -> None:
         for oid, group in in_work.groupby(C_ORDER, sort=False):
             target = group["_target_store"].iloc[0]
             incoming = group[C_MOVE].iloc[0] == TRUE_VAL
+            is_pz_item = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
+            has_edit = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
             is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
-            tag = " 🚚 ПЕРЕМЕЩЕНИЕ" if is_move_needed else ""
-            with st.expander(f"Заказ №{oid}{tag}"):
+            tags = []
+            if is_move_needed: tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+            if has_edit: tags.append("⚠️ ПРАВКА")
+            if is_pz_item: tags.append("⏳ ПЗ")
+            
+            tag_str = " | ".join(tags)
+            with st.expander(f"Заказ №{oid}{f' [{tag_str}]' if tags else ''}"):
+                if has_edit: st.error(f"Правка: {group[C_EDIT].iloc[0]}")
                 render_order_table(group, TABLE_COLS, COL_RENAME)
-                if is_move_needed:
+                
+                if has_edit:
+                    if st.button("Учесть правку", key=f"rev_w_{oid}"):
+                        st.session_state.reviewed_changes.add(oid)
+                        save_persistent_state()
+                        st.rerun()
+                elif is_move_needed:
                     if st.button("🚛 ОТПРАВИТЬ ПЕРЕМЕЩЕНИЕ", key=f"mv_{oid}", type="primary", use_container_width=True):
                         update_google_cells(group, C, {"MOVE": TRUE_VAL})
                         st.session_state.local_in_work.discard(oid)
@@ -280,6 +313,7 @@ def render_store(current_store: str) -> None:
                     if st.button(label, key=f"dn_{oid}", type="primary", use_container_width=True):
                         update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
                         st.session_state.local_in_work.discard(oid)
+                        st.session_state.reviewed_changes.discard(oid)
                         save_persistent_state()
                         st.rerun()
 
