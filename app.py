@@ -119,10 +119,33 @@ def get_spreadsheet() -> gspread.Spreadsheet:
 # ── СОСТОЯНИЕ В GOOGLE SHEETS ─────────────────────────────────────────────────
 
 def _get_state_worksheet() -> gspread.Worksheet:
-    """Возвращает лист avenue_state, создаёт при отсутствии."""
+    """
+    Возвращает лист avenue_state, создаёт при отсутствии.
+    При обнаружении старого формата (< 4 колонок) — автоматически мигрирует.
+    """
     ss = get_spreadsheet()
     try:
-        return ss.worksheet(STATE_TAB_NAME)
+        ws = ss.worksheet(STATE_TAB_NAME)
+        # Проверяем структуру — если заголовок старый, мигрируем
+        header = ws.row_values(1)
+        if len(header) < 4:
+            rows = ws.get_all_values()
+            old_data = rows[1:] if len(rows) > 1 else []
+            ws.clear()
+            ws.update(
+                [["local_in_work", "reviewed_changes", "confirmed_cancels", "completed_log"]]
+                + [
+                    [
+                        r[0] if len(r) > 0 else "",
+                        r[1] if len(r) > 1 else "",
+                        "",
+                        "",
+                    ]
+                    for r in old_data
+                ],
+                value_input_option="RAW",
+            )
+        return ws
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(STATE_TAB_NAME, rows=5000, cols=4)
         ws.update(
@@ -606,7 +629,13 @@ elif menu == "🚫 Отмененные заказы":
     if cancelled.empty:
         st.info("Подтверждённых отмен пока нет.")
     else:
-        st.dataframe(
-            cancelled[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME),
-            use_container_width=True, hide_index=True,
-        )
+        for oid, group in cancelled.groupby(C_ORDER, sort=False):
+            with st.expander(f"Заказ №{oid}"):
+                render_order_table(group, TABLE_COLS, COL_RENAME)
+                if st.button(
+                    "↩️ Снять подтверждение отмены", key=f"uncancel_{oid}",
+                    use_container_width=True,
+                ):
+                    st.session_state.confirmed_cancels.discard(str(oid))
+                    save_persistent_state()
+                    st.rerun()
