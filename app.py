@@ -182,21 +182,21 @@ def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) 
     st.table(group[table_cols].rename(columns=col_rename))
 
 def get_warehouse_squares(group: pd.DataFrame) -> str:
-    """Генерирует только цветные квадраты складов."""
+    """Генерирует квадраты складов заказа."""
     all_whs = " ".join(group[C_WH].fillna("").astype(str)).lower()
     squares = []
+    # Вариант 1 (из вашего первого запроса): чистые квадраты без букв
     if "сток" in all_whs: squares.append("🟦")
     if "горб" in all_whs: squares.append("🟪")
     if "пекин" in all_whs: squares.append("🟩")
     return "".join(squares)
 
-def build_header(oid, icons_list, squares):
-    """Собирает чистый заголовок без HTML-тегов с отступом."""
-    icon_str = f" | {' | '.join(icons_list)}" if icons_list else ""
-    # Используем широкий пробел \u2001 для имитации смещения вправо
-    # Это не выводит код в интерфейс
-    spacer = "\u2001" * 20 
-    return f"{oid}{icon_str} {spacer} {squares}"
+def build_header_with_squares(oid, tags_str, squares):
+    """Собирает заголовок с полным текстом и квадратами в правом краю."""
+    # Используем широкий неразрывный пробел \u2001 для динамического отступа
+    # Это позволяет избежать появления HTML-кода в интерфейсе
+    spacer = "\u2001" * 15
+    return f"Заказ №{oid}{tags_str} {spacer} {squares}"
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 df_mem, C = load_data_integrated()
@@ -238,10 +238,12 @@ if st.sidebar.button("🔃 Обновить вручную"):
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
 
+    # Учет новых заказов (алерты)
     store_new_alert = {oid for oid in st.session_state.new_orders_alert if oid in work_base[C_ORDER].values}
     if store_new_alert:
         st.success(f"🆕 Новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
     
+    # Фильтр складов (Горбушка + СТОК как одно целое)
     if current_store == "Горбушка":
         wh_match = work_base[C_WH].str.contains("Горб|Сток", case=False, na=False)
     else:
@@ -249,6 +251,7 @@ def render_store(current_store: str) -> None:
 
     is_pz_row = work_base[C_WH].isin(PZ_LIST)
     is_f_match = wh_match & ~is_pz_row
+    # Товар в ПЗ считается готовым к выдаче/сборке, если стоит галка "Под ЗАКАЗ" (INWORK)
     is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & (work_base[C_INWORK] == TRUE_VAL)
     is_move = work_base[C_MOVE] == TRUE_VAL
     is_incoming = is_move & (work_base["_target_store"] == current_store)
@@ -267,21 +270,28 @@ def render_store(current_store: str) -> None:
             incoming = group[C_MOVE].iloc[0] == TRUE_VAL
             is_pz_item = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
             has_edit = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
+            
+            # Если склад СТОК, а цель Пекин — помечаем как перемещение
             is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
-            icons = []
-            if "d" in comment_str: icons.append("📦")
-            if is_move_needed: icons.append("🚚")
-            if has_edit: icons.append("⚠️")
-            if is_pz_item: icons.append("⏳")
-            if incoming: icons.append("🚚💨")
+            tags = []
+            if "d" in comment_str: tags.append("📦 ДОСТАВКА")
+            if is_move_needed: tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+            if has_edit: tags.append("⚠️ ИЗМЕНЕНИЕ")
+            if is_pz_item: tags.append("⏳ ПЗ")
+            if incoming: tags.append("🚚 ЕДЕТ")
             
+            # Текст тегов, как в изначальном коде
+            tag_str = f" [{ ' | '.join(tags) }]" if tags else ""
             squares = get_warehouse_squares(group)
-            header_label = build_header(oid, icons, squares)
+            
+            # Формируем заголовок с текстом И квадратами
+            header_label = build_header_with_squares(oid, tag_str, squares)
             
             with st.expander(header_label):
                 if has_edit: st.error(f"Изменение: {group[C_EDIT].iloc[0]}")
                 render_order_table(group, TABLE_COLS, COL_RENAME)
+                
                 if has_edit:
                     if st.button("Учесть Изменение", key=f"rev_n_{oid}"):
                         st.session_state.reviewed_changes.add(oid)
@@ -304,18 +314,20 @@ def render_store(current_store: str) -> None:
             has_edit = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
             is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
-            icons = []
-            if "d" in comment_str: icons.append("📦")
-            if is_move_needed: icons.append("🚚")
-            if has_edit: icons.append("⚠️")
-            if is_pz_item: icons.append("⏳")
+            tags = []
+            if "d" in comment_str: tags.append("📦 ДОСТАВКА")
+            if is_move_needed: tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+            if has_edit: tags.append("⚠️ ПРАВКА")
+            if is_pz_item: tags.append("⏳ ПЗ")
             
+            tag_str = f" [{ ' | '.join(tags) }]" if tags else ""
             squares = get_warehouse_squares(group)
-            header_label = build_header(oid, icons, squares)
+            header_label = build_header_with_squares(oid, tag_str, squares)
             
             with st.expander(header_label):
                 if has_edit: st.error(f"Правка: {group[C_EDIT].iloc[0]}")
                 render_order_table(group, TABLE_COLS, COL_RENAME)
+                
                 if has_edit:
                     if st.button("Учесть правку", key=f"rev_w_{oid}"):
                         st.session_state.reviewed_changes.add(oid)
@@ -344,8 +356,8 @@ elif menu == "🚚 Перемещения (Активные)":
     moves = work_base[work_base[C_MOVE] == TRUE_VAL]
     for oid, group in moves.groupby(C_ORDER, sort=False):
         squares = get_warehouse_squares(group)
-        header_label = build_header(oid, ["АКТИВНО"], squares)
-        with st.expander(header_label):
+        # Также добавляем квадраты в раздел перемещений
+        with st.expander(f"Перемещение №{oid} \u2001 {squares}"):
             render_order_table(group, TABLE_COLS, COL_RENAME)
             if st.button("Удалить из списка", key=f"cl_mv_{oid}"):
                 update_google_cells(group, C, {"MOVE": FALSE_VAL})
