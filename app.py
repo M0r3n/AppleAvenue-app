@@ -249,6 +249,12 @@ if "local_in_work" not in st.session_state:
     st.session_state.new_orders_alert  = set()
     st.session_state.last_sync         = "Не обновлялось"
 
+# Защита: если сессия стартовала со старым кодом — добираем недостающие ключи
+if "completed_log" not in st.session_state:
+    st.session_state.completed_log = []
+if "confirmed_cancels" not in st.session_state:
+    st.session_state.confirmed_cancels = set()
+
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
