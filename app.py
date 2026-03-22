@@ -407,10 +407,18 @@ if st.sidebar.button("🔃 Обновить данные сейчас"):
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
 
+    wh_pattern_alert = "Горб|Сток" if current_store == STORE_GORB else "Пекин"
+    store_order_ids = set(
+        work_base[
+            work_base[C_WH].str.contains(wh_pattern_alert, case=False, na=False)
+            & ~work_base[C_WH].isin(PZ_LIST)
+        ][C_ORDER].unique()
+    )
     store_new_alert = {
         oid for oid in st.session_state.new_orders_alert
-        if oid in work_base[C_ORDER].values
+        if oid in store_order_ids
     }
+
     if store_new_alert:
         st.success(
             f"🆕 Обнаружены новые заказы: "
