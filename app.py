@@ -1,6 +1,6 @@
 """
 Авеню: Система Заказов
-v3 — оптимизация производительности, синхронизации и читаемости кода.
+v4 — рефакторинг, оптимизация, чистка кода.
 """
 
 from __future__ import annotations
@@ -15,25 +15,24 @@ import streamlit as st
 from google.oauth2.credentials import Credentials
 from streamlit_autorefresh import st_autorefresh
 
-# ── КОНСТАНТЫ ────────────────────────────────────────────────────────────────
-SHEET_ID       = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
-TAB_NAME       = "Заказы ИМ Авеню"
-STATE_TAB_NAME = "avenue_state"
-PZ_LIST        = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
-START_ROW      = 26596
-TRUE_VAL       = "TRUE"
-FALSE_VAL      = "FALSE"
-COOKIE_NAME    = "avenue_auth_status"
-COOKIE_VALUE   = "authorized"
-COOKIE_DAYS    = 30
-REFRESH_MS     = 600_000   # 10 минут
-PREVIEW_ORDERS = 50
-STORE_GORB     = "Горбушка"
-STORE_PEKIN    = "Пекин"
-STORE_TIK      = "ТИК"
-CANCELLED_VAL  = "Отменён"
-STORE_TIK      = "ТИК"
-STATE_SYNC_TTL = 15        # секунд между синхронизациями состояния
+# ── КОНСТАНТЫ ─────────────────────────────────────────────────────────────────
+SHEET_ID        = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
+TAB_NAME        = "Заказы ИМ Авеню"
+STATE_TAB_NAME  = "avenue_state"
+PZ_LIST         = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
+START_ROW       = 26596
+TRUE_VAL        = "TRUE"
+FALSE_VAL       = "FALSE"
+COOKIE_NAME     = "avenue_auth_status"
+COOKIE_VALUE    = "authorized"
+COOKIE_DAYS     = 30
+REFRESH_MS      = 600_000   # 10 минут
+PREVIEW_ORDERS  = 50
+STORE_GORB      = "Горбушка"
+STORE_PEKIN     = "Пекин"
+STORE_TIK       = "ТИК"
+CANCELLED_VAL   = "Отменён"
+STATE_SYNC_TTL  = 15        # секунд между синхронизациями состояния
 
 _PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
 _GORB_KEYWORDS  = ("горб", "грб", "gorb")
@@ -47,10 +46,10 @@ MENU_OPTIONS = [
     "🚫 Отмененные заказы",
 ]
 
-# ── НАСТРОЙКА СТРАНИЦЫ ───────────────────────────────────────────────────────
+# ── НАСТРОЙКА СТРАНИЦЫ ────────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
 
-# ── АВТОРИЗАЦИЯ ──────────────────────────────────────────────────────────────
+# ── АВТОРИЗАЦИЯ ───────────────────────────────────────────────────────────────
 if "cookie_manager" not in st.session_state:
     st.session_state.cookie_manager = stx.CookieManager(key="avenue_auth_manager_v4")
 
@@ -92,9 +91,7 @@ def check_password() -> bool:
 if not check_password():
     st.stop()
 
-# ── GOOGLE SHEETS: РЕСУРСЫ ───────────────────────────────────────────────────
-# Объекты клиента и листов кешируются на всё время жизни процесса.
-# Это безопасно: gspread-объекты переиспользуют HTTP-сессию и не хранят данные.
+# ── GOOGLE SHEETS: РЕСУРСЫ ────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_gspread_client() -> gspread.Client:
@@ -184,7 +181,6 @@ def save_state_to_sheets() -> None:
         ws = get_state_worksheet()
         ws.clear()
         ws.update(rows, value_input_option="RAW")
-
         load_state_from_sheets.clear()
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
@@ -269,8 +265,7 @@ def identify_target_store(comment: str) -> str:
     """
     Определяет магазин-получатель по тексту комментария.
     'd' в комментарии → доставка → всегда Горбушка.
-    Иначе по ключевым словам Пекина / Горбушки.
-    Используется и для обычных складов, и для ТИК.
+    Иначе — по ключевым словам Пекина / Горбушки.
     """
     c = str(comment).lower()
     if "d" in c:
@@ -329,7 +324,7 @@ refresh_count = (
     else 0
 )
 
-# ── ИНИЦИАЛИЗАЦИЯ СЕССИИ ─────────────────────────────────────────────────────
+# ── ИНИЦИАЛИЗАЦИЯ СЕССИИ ──────────────────────────────────────────────────────
 if "session_initialized" not in st.session_state:
     state = load_state_from_sheets()
     st.session_state.local_in_work         = state["in_work"]
@@ -342,11 +337,8 @@ if "session_initialized" not in st.session_state:
     st.session_state.last_sync             = "Не обновлялось"
     st.session_state.session_initialized   = True
 else:
-    # Синхронизируем in_work при каждом рендере — это самое часто меняющееся поле.
-    # reviewed/confirmed/log обновляются только при явных действиях пользователя.
-    # TTL кеша (15 сек) гарантирует, что другие устройства видят актуальные данные.
-    fresh = load_state_from_sheets()
-    st.session_state.local_in_work = fresh["in_work"]
+    # Синхронизируем in_work при каждом рендере через TTL-кеш (15 сек).
+    st.session_state.local_in_work = load_state_from_sheets()["in_work"]
 
 if refresh_count > 0:
     load_data.clear()
@@ -358,7 +350,7 @@ if df_mem.empty or not C:
     st.error("Не удалось загрузить данные. Проверьте таблицу и настройки.")
     st.stop()
 
-cols = df_mem.columns
+cols      = df_mem.columns
 C_ORDER   = cols[C["ORDER"]]
 C_PRODUCT = cols[C["PRODUCT"]]
 C_QTY     = cols[C["QTY"]]
@@ -424,8 +416,9 @@ if st.sidebar.button("🔃 Обновить данные сейчас"):
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
 
-    # Оповещение о новых заказах этого магазина
     wh_pattern = "Горб|Сток" if current_store == STORE_GORB else "Пекин"
+
+    # Оповещение о новых заказах этого магазина
     store_order_ids = set(
         work_base[
             work_base[C_WH].str.contains(wh_pattern, case=False, na=False)
@@ -447,10 +440,7 @@ def render_store(current_store: str) -> None:
         (work_base[C_WH] == f"ПЗ {current_store}")
         & (work_base[C_INWORK] == TRUE_VAL)
     )
-    is_incoming = is_move & (work_base["_target_store"] == current_store)
-
-    # ТИК-заказы: склад = "ТИК", галочка Перемещение ещё НЕ стоит,
-    # целевой магазин — текущий. Показываем в «Новых», ждут подтверждения отправки.
+    is_incoming    = is_move & (work_base["_target_store"] == current_store)
     is_tik_pending = (
         (work_base[C_WH].str.strip() == STORE_TIK)
         & ~is_move
@@ -467,7 +457,7 @@ def render_store(current_store: str) -> None:
 
     base_mask = ((is_f_match | is_pz_match) & ~is_move) | is_incoming | is_tik_pending
 
-    # Определяем непросмотренные изменения векторно
+    # Непросмотренные изменения — векторно
     reviewed     = st.session_state.reviewed_changes
     edit_series  = work_base[C_EDIT].fillna("").str.strip()
     order_series = work_base[C_ORDER]
@@ -485,7 +475,6 @@ def render_store(current_store: str) -> None:
         (base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev) & not_confirmed_cancelled)
         | is_cancelled_unconfirmed
     ].copy()
-    # Передаём флаг ТИК в display_df для использования в _render_order
     display_df["_is_tik_pending"] = is_tik_pending.reindex(display_df.index, fill_value=False)
 
     in_work_ids = st.session_state.local_in_work
@@ -540,9 +529,6 @@ def render_store(current_store: str) -> None:
                     st.rerun()
 
             elif tik_pending:
-                # ТИК-заказ: две независимые кнопки
-                # 1. Подтвердить перемещение — ставит TRUE в графу Перемещение,
-                #    заказ остаётся в «Новых» (теперь будет виден как is_incoming)
                 if st.button(
                     "🚛 Подтвердить перемещение с ТИК", key=f"tik_mv_{oid}",
                     type="primary", use_container_width=True,
@@ -551,7 +537,6 @@ def render_store(current_store: str) -> None:
                     st.rerun()
 
                 st.markdown("---")
-                # 2. Взять в работу — стандартное поведение магазина
                 if not in_work_section:
                     if st.button("В работу", key=f"w_{oid}", use_container_width=True):
                         st.session_state.local_in_work.add(oid)
