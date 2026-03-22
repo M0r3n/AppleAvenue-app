@@ -264,9 +264,14 @@ def _review_key(oid, edit_text: str) -> str:
 
 
 def identify_target_store(comment: str) -> str:
-    """Определяет магазин-получатель по тексту комментария."""
+    """
+    Определяет магазин-получатель по тексту комментария.
+    Если комментарий содержит "d" — это доставка, которая всегда идёт на Горбушку.
+    Если товар с разных складов (Пекин/ТИК) — нужно перемещение на Горбушку.
+    """
     c = str(comment).lower()
-    # Проверяем ключевые слова; «доставка» не определяет магазин — это отдельный тег
+    if "d" in c:
+        return STORE_GORB
     if any(k in c for k in _PEKIN_KEYWORDS):
         return STORE_PEKIN
     if any(k in c for k in _GORB_KEYWORDS):
@@ -275,8 +280,8 @@ def identify_target_store(comment: str) -> str:
 
 
 def is_delivery(comment: str) -> bool:
-    """Признак доставки — отдельная проверка, чтобы не смешивать с определением магазина."""
-    return "доставка" in str(comment).lower() or comment.lower().strip().startswith("d")
+    """Признак доставки: буква 'd' в комментарии = доставка на Горбушку."""
+    return "d" in str(comment).lower()
 
 
 def _build_tags(
