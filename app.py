@@ -1,18 +1,19 @@
 """
 Авеню: Система Заказов
-Оптимизированная версия: производительность, безопасность, стабильность.
-Функционал и интерфейс сохранены полностью.
+Оптимизированная версия v2: производительность, безопасность, стабильность.
 """
 
 from __future__ import annotations
 
-import streamlit as st
+import hmac
+from datetime import datetime, timedelta
+
+import extra_streamlit_components as stx
 import gspread
 import pandas as pd
-from datetime import datetime, timedelta
-from streamlit_autorefresh import st_autorefresh
+import streamlit as st
 from google.oauth2.credentials import Credentials
-import extra_streamlit_components as stx
+from streamlit_autorefresh import st_autorefresh
 
 # ── КОНСТАНТЫ ────────────────────────────────────────────────────────────────
 SHEET_ID       = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
@@ -72,8 +73,6 @@ def check_password() -> bool:
     remember = st.checkbox("Запомнить меня на этом устройстве", value=True)
 
     if st.button("Войти", key="login_btn", type="primary"):
-        # Сравнение через hmac.compare_digest для защиты от timing-атак
-        import hmac
         if hmac.compare_digest(pwd, st.secrets["password"]):
             st.session_state.password_correct = True
             if remember:
@@ -119,9 +118,9 @@ def get_spreadsheet() -> gspread.Spreadsheet:
     return get_client().open_by_key(SHEET_ID)
 
 
-# ── СОСТОЯНИЕ В GOOGLE SHEETS ─────────────────────────────────────────────────
-
-def _get_state_worksheet() -> gspread.Worksheet:
+@st.cache_resource
+def get_state_worksheet() -> gspread.Worksheet:
+    """Кешируем объект листа состояний — создаём при необходимости."""
     ss = get_spreadsheet()
     try:
         return ss.worksheet(STATE_TAB_NAME)
@@ -134,38 +133,45 @@ def _get_state_worksheet() -> gspread.Worksheet:
         return ws
 
 
-# ── ЗАГРУЗКА local_in_work из Sheets с коротким TTL (синхронизация между устройствами) ──
+@st.cache_resource
+def get_orders_worksheet() -> gspread.Worksheet:
+    """Кешируем объект листа заказов."""
+    ss = get_spreadsheet()
+    try:
+        return ss.worksheet(TAB_NAME)
+    except gspread.WorksheetNotFound:
+        return ss.get_worksheet(0)
+
+
+# ── СОСТОЯНИЕ В GOOGLE SHEETS ─────────────────────────────────────────────────
+# Единый кеш для всего состояния с коротким TTL (синхронизация между устройствами)
 
 @st.cache_data(ttl=15)
-def load_in_work_from_sheets() -> set:
-    """Загружает актуальный список заказов в работе. TTL=15 сек — быстрая синхронизация."""
+def load_full_state_from_sheets() -> dict:
+    """
+    Загружает всё состояние за один вызов API.
+    TTL=15 сек — быстрая синхронизация между устройствами.
+    """
     try:
-        rows = _get_state_worksheet().get_all_values()
+        rows = get_state_worksheet().get_all_values()
         if len(rows) < 2:
-            return set()
-        return {r[0] for r in rows[1:] if r[0].strip()}
-    except Exception:
-        return set()
-
-
-def load_persistent_state() -> tuple[set, set, list]:
-    """Загружает reviewed_changes, confirmed_cancels, completed_log (без in_work — он отдельно)."""
-    try:
-        rows = _get_state_worksheet().get_all_values()
-        if len(rows) < 2:
-            return set(), set(), []
-        reviewed  = {r[1] for r in rows[1:] if len(r) > 1 and r[1].strip()}
-        confirmed = {r[2] for r in rows[1:] if len(r) > 2 and r[2].strip()}
-        log       = [r[3] for r in rows[1:] if len(r) > 3 and r[3].strip()]
-        return reviewed, confirmed, log
+            return {"in_work": set(), "reviewed": set(), "confirmed": set(), "log": []}
+        data_rows = rows[1:]
+        return {
+            "in_work":   {r[0] for r in data_rows if r[0].strip()},
+            "reviewed":  {r[1] for r in data_rows if len(r) > 1 and r[1].strip()},
+            "confirmed": {r[2] for r in data_rows if len(r) > 2 and r[2].strip()},
+            "log":       [r[3] for r in data_rows if len(r) > 3 and r[3].strip()],
+        }
     except Exception as e:
         st.warning(f"Не удалось загрузить состояние из Sheets: {e}")
-        return set(), set(), []
+        return {"in_work": set(), "reviewed": set(), "confirmed": set(), "log": []}
 
 
-def save_persistent_state() -> None:
+def save_state_to_sheets() -> None:
+    """Сохраняет всё состояние одним запросом. Сбрасывает кеш для синхронизации."""
     try:
-        ws        = _get_state_worksheet()
+        ws        = get_state_worksheet()
         in_work   = list(st.session_state.local_in_work)
         reviewed  = list(st.session_state.reviewed_changes)
         confirmed = list(st.session_state.confirmed_cancels)
@@ -181,8 +187,8 @@ def save_persistent_state() -> None:
             + list(zip(pad(in_work), pad(reviewed), pad(confirmed), pad(log))),
             value_input_option="RAW",
         )
-        # Сбрасываем кеш — другие устройства сразу увидят изменения (макс. 15 сек)
-        load_in_work_from_sheets.clear()
+        # Сбрасываем кеш — все устройства получат свежие данные через ≤15 сек
+        load_full_state_from_sheets.clear()
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
 
@@ -239,34 +245,33 @@ def _build_tags(
 # ── АВТООБНОВЛЕНИЕ ────────────────────────────────────────────────────────────
 st.session_state.setdefault("auto_refresh_enabled", True)
 
-refresh_count = st_autorefresh(
-    interval=REFRESH_MS,
-    key="data_refresh",
-) if st.session_state.auto_refresh_enabled else 0
+if st.session_state.auto_refresh_enabled:
+    refresh_count = st_autorefresh(interval=REFRESH_MS, key="data_refresh")
+else:
+    refresh_count = 0
 
 # ── ИНИЦИАЛИЗАЦИЯ СЕССИИ ─────────────────────────────────────────────────────
+# Все состояния загружаем одним запросом к Sheets
 if "reviewed_changes" not in st.session_state:
-    saved_reviewed, saved_confirmed, saved_log = load_persistent_state()
-    st.session_state.reviewed_changes  = saved_reviewed
-    st.session_state.confirmed_cancels = saved_confirmed
-    st.session_state.completed_log     = saved_log
+    state = load_full_state_from_sheets()
+    st.session_state.local_in_work     = state["in_work"]
+    st.session_state.reviewed_changes  = state["reviewed"]
+    st.session_state.confirmed_cancels = state["confirmed"]
+    st.session_state.completed_log     = state["log"]
     st.session_state.prev_order_ids    = set()
     st.session_state.new_orders_alert  = set()
     st.session_state.last_sync         = "Не обновлялось"
-
-# Добавляем недостающие ключи для обратной совместимости со старыми сессиями
-st.session_state.setdefault("completed_log", [])
-st.session_state.setdefault("confirmed_cancels", set())
-
-# local_in_work всегда берётся из Sheets (TTL 15 сек) — синхронизация между устройствами
-st.session_state.local_in_work = load_in_work_from_sheets()
+else:
+    # При каждом рендере синхронизируем только in_work (меняется чаще всего)
+    # reviewed/confirmed/log синхронизируются при явных действиях пользователя
+    fresh = load_full_state_from_sheets()
+    st.session_state.local_in_work = fresh["in_work"]
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
-def load_data_integrated() -> tuple[pd.DataFrame, dict]:
-    ss       = get_client().open_by_key(SHEET_ID)
-    sheet    = ss.worksheet(TAB_NAME) if TAB_NAME else ss.get_worksheet(0)
+def load_data() -> tuple[pd.DataFrame, dict]:
+    sheet    = get_orders_worksheet()
     raw_data = sheet.get_all_values()
 
     if not raw_data:
@@ -314,17 +319,7 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
 
 
 if refresh_count > 0:
-    load_data_integrated.clear()
-
-
-@st.cache_resource
-def get_orders_worksheet() -> gspread.Worksheet:
-    """Кешируем объект листа — не открываем при каждом действии."""
-    ss = get_spreadsheet()
-    try:
-        return ss.worksheet(TAB_NAME)
-    except gspread.WorksheetNotFound:
-        return ss.get_worksheet(0)
+    load_data.clear()
 
 
 def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> None:
@@ -336,11 +331,11 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
     ]
     if cell_list:
         sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
-    load_data_integrated.clear()
+    load_data.clear()
 
 
 # ── ПОДГОТОВКА ДАННЫХ ─────────────────────────────────────────────────────────
-df_mem, C = load_data_integrated()
+df_mem, C = load_data()
 
 if df_mem.empty or not C:
     st.error("Не удалось загрузить данные. Проверьте таблицу и настройки.")
@@ -385,7 +380,6 @@ work_base["_is_cancelled"] = (
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
 
-# Переключатель автообновления
 auto_refresh = st.sidebar.toggle(
     "🔄 Автообновление (10 мин)",
     value=st.session_state.auto_refresh_enabled,
@@ -404,8 +398,8 @@ st.sidebar.markdown("---")
 st.sidebar.caption(f"🔄 Последняя синхронизация: **{st.session_state.last_sync}**")
 
 if st.sidebar.button("🔃 Обновить данные сейчас"):
-    load_data_integrated.clear()
-    load_in_work_from_sheets.clear()
+    load_data.clear()
+    load_full_state_from_sheets.clear()
     st.rerun()
 
 # ── ЛОГИКА ОТОБРАЖЕНИЯ МАГАЗИНА ───────────────────────────────────────────────
@@ -505,14 +499,14 @@ def render_store(current_store: str) -> None:
                     st.session_state.confirmed_cancels.add(str(oid))
                     st.session_state.local_in_work.discard(oid)
                     _log_action(oid, group, current_store, "cancel_confirmed")
-                    save_persistent_state()
+                    save_state_to_sheets()
                     st.rerun()
 
             elif has_edit:
                 btn_label = "Учесть правку" if in_work_section else "Учесть Изменение"
                 if st.button(btn_label, key=f"rev_{'w' if in_work_section else 'n'}_{oid}"):
                     st.session_state.reviewed_changes.add(_review_key(oid, edit_text))
-                    save_persistent_state()
+                    save_state_to_sheets()
                     st.rerun()
 
             elif in_work_section:
@@ -523,7 +517,7 @@ def render_store(current_store: str) -> None:
                     ):
                         update_google_cells(group, C, {"MOVE": TRUE_VAL})
                         st.session_state.local_in_work.discard(oid)
-                        save_persistent_state()
+                        save_state_to_sheets()
                         st.rerun()
                 else:
                     action_label = "✅ ПРИНЯТО И СОБРАНО" if incoming else "✅ ЗАВЕРШИТЬ СБОРКУ"
@@ -535,7 +529,7 @@ def render_store(current_store: str) -> None:
                         st.session_state.local_in_work.discard(oid)
                         st.session_state.reviewed_changes.discard(_review_key(oid, edit_text))
                         _log_action(oid, group, current_store, "done")
-                        save_persistent_state()
+                        save_state_to_sheets()
                         st.rerun()
 
                     st.markdown("---")
@@ -545,13 +539,13 @@ def render_store(current_store: str) -> None:
                     ):
                         update_google_cells(group, C, {"STATUS": CANCELLED_VAL})
                         st.session_state.local_in_work.discard(oid)
-                        save_persistent_state()
+                        save_state_to_sheets()
                         st.rerun()
 
             else:
                 if st.button("В работу", key=f"w_{oid}", use_container_width=True):
                     st.session_state.local_in_work.add(oid)
-                    save_persistent_state()
+                    save_state_to_sheets()
                     st.rerun()
 
     with col1:
