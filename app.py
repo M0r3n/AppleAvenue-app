@@ -188,19 +188,19 @@ def get_warehouse_squares(group: pd.DataFrame) -> str:
     if "сток" in all_whs: squares.append("🟦")
     if "горб" in all_whs: squares.append("🟪")
     if "пекин" in all_whs: squares.append("🟩")
-    return " ".join(squares)
+    return "".join(squares)
 
 def build_header_with_squares(oid, tags_str, squares):
-    """Сборка заголовка с использованием неразрывных пробелов для выравнивания."""
-    # Базовый текст заказа (Заказ №... [теги])
-    base_text = f"Заказ №{oid}{tags_str}"
+    """Сборка заголовка с выравниванием квадратов в ровный столбец."""
+    text = f"Заказ №{oid}{tags_str}"
     
-    # Мы используем специальный длинный пробел (\u2001), который Streamlit не режет.
-    # Количество пробелов подобрано так, чтобы на большинстве экранов выталкивать 
-    # квадраты к правому краю, не используя <span>.
-    spacer = "\u2001" * 15
+    # Чтобы квадраты стояли в один столбец, мы дополняем строку пробелами.
+    # Длина 45 символов — это примерный порог, после которого идут квадраты.
+    # \u2001 — это специальный "широкий" пробел, который не схлопывается браузером.
+    padding_needed = max(1, 40 - len(text))
+    spacer = "\u2001" * padding_needed
     
-    return f"{base_text} {spacer} {squares}"
+    return f"{text}{spacer}{squares}"
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 df_mem, C = load_data_integrated()
