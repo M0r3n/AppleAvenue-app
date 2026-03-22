@@ -254,13 +254,14 @@ else:
 # Все состояния загружаем одним запросом к Sheets
 if "reviewed_changes" not in st.session_state:
     state = load_full_state_from_sheets()
-    st.session_state.local_in_work     = state["in_work"]
-    st.session_state.reviewed_changes  = state["reviewed"]
-    st.session_state.confirmed_cancels = state["confirmed"]
-    st.session_state.completed_log     = state["log"]
-    st.session_state.prev_order_ids    = set()
-    st.session_state.new_orders_alert  = set()
-    st.session_state.last_sync         = "Не обновлялось"
+    st.session_state.local_in_work         = state["in_work"]
+    st.session_state.reviewed_changes      = state["reviewed"]
+    st.session_state.confirmed_cancels     = state["confirmed"]
+    st.session_state.completed_log         = state["log"]
+    st.session_state.prev_order_ids        = set()
+    st.session_state.new_orders_alert      = set()
+    st.session_state.new_orders_alert_time = None
+    st.session_state.last_sync             = "Не обновлялось"
 else:
     # При каждом рендере синхронизируем только in_work (меняется чаще всего)
     # reviewed/confirmed/log синхронизируются при явных действиях пользователя
@@ -367,7 +368,8 @@ current_order_ids = set(df_mem[C_ORDER].unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
     if new_ids:
-        st.session_state.new_orders_alert = new_ids
+        st.session_state.new_orders_alert      = new_ids
+        st.session_state.new_orders_alert_time = datetime.now()
 st.session_state.prev_order_ids = current_order_ids
 
 # Основной датафрейм с вычисленными служебными колонками
@@ -419,7 +421,8 @@ def render_store(current_store: str) -> None:
         if oid in store_order_ids
     }
 
-    if store_new_alert:
+    alert_time = st.session_state.get("new_orders_alert_time")
+    if store_new_alert and alert_time and (datetime.now() - alert_time).total_seconds() < 10:
         st.success(
             f"🆕 Обнаружены новые заказы: "
             f"{', '.join(str(o) for o in sorted(store_new_alert))}"
