@@ -221,7 +221,12 @@ def _build_tags(
 
 
 # ── АВТООБНОВЛЕНИЕ И ИНИЦИАЛИЗАЦИЯ ───────────────────────────────────────────
-refresh_count = st_autorefresh(interval=REFRESH_MS, key="data_refresh")
+st.session_state.setdefault("auto_refresh_enabled", True)
+
+refresh_count = st_autorefresh(
+    interval=REFRESH_MS,
+    key="data_refresh",
+) if st.session_state.auto_refresh_enabled else 0
 
 if "local_in_work" not in st.session_state:
     saved_in_work, saved_reviewed, saved_confirmed, saved_log = load_persistent_state()
@@ -360,6 +365,15 @@ work_base["_is_cancelled"] = (
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
+
+# Переключатель автообновления
+auto_refresh = st.sidebar.toggle(
+    "🔄 Автообновление (10 мин)",
+    value=st.session_state.auto_refresh_enabled,
+    key="auto_refresh_toggle",
+)
+st.session_state.auto_refresh_enabled = auto_refresh
+
 menu = st.sidebar.selectbox("Выберите раздел:", MENU_OPTIONS)
 
 if st.sidebar.button("🚪 Выйти"):
