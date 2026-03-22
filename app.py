@@ -22,42 +22,41 @@ COOKIE_NAME    = "avenue_auth_status"
 COOKIE_VALUE   = "authorized"
 COOKIE_DAYS    = 30
 REFRESH_MS     = 600_000  # 10 минут
-PREVIEW_ORDERS = 50       # кол-во заказов в «Выполненных»
+PREVIEW_ORDERS = 50       
 
 # ── НАСТРОЙКА СТРАНИЦЫ ───────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
 
 # ── АВТОРИЗАЦИЯ ──────────────────────────────────────────────────────────────
-cookie_manager = stx.CookieManager(key="avenue_auth_manager_v3")
+cookie_manager = stx.CookieManager(key="avenue_auth_manager_v4")
 
 def check_password() -> bool:
     if st.session_state.get("password_correct"):
         return True
+    
     all_cookies = cookie_manager.get_all()
-    if all_cookies is None:
-        time.sleep(0.8)
-        all_cookies = cookie_manager.get_all()
+    # Проверка куки без долгого sleep для отзывчивости
     if all_cookies and str(all_cookies.get(COOKIE_NAME)) == COOKIE_VALUE:
         st.session_state.password_correct = True
         return True
+
     st.title("🔐 Вход в систему")
     if "password" not in st.secrets:
         st.error("Критическая ошибка: Пароль не настроен в Secrets.")
         st.stop()
+
     pwd = st.text_input("Введите код доступа:", type="password", key="login_input")
     remember = st.checkbox("Запомнить меня на этом устройстве", value=True)
+    
     if st.button("Войти", key="login_btn", type="primary"):
         if pwd == st.secrets["password"]:
             st.session_state.password_correct = True
             if remember:
-                with st.spinner("Запоминаем устройство..."):
-                    cookie_manager.set(
-                        COOKIE_NAME,
-                        COOKIE_VALUE,
-                        expires_at=datetime.now() + timedelta(days=COOKIE_DAYS),
-                        key="save_cookie_op",
-                    )
-                    time.sleep(1.2)
+                cookie_manager.set(
+                    COOKIE_NAME,
+                    COOKIE_VALUE,
+                    expires_at=datetime.now() + timedelta(days=COOKIE_DAYS),
+                )
             st.rerun()
         else:
             st.error("❌ Неверный код")
@@ -94,8 +93,9 @@ def save_persistent_state() -> None:
     except OSError as e:
         st.warning(f"Не удалось сохранить состояние: {e}")
 
-# ── ИНИЦИАЛИЗАЦИЯ SESSION STATE ───────────────────────────────────────────────
-st_autorefresh(interval=REFRESH_MS, key="data_refresh")
+# ── АВТООБНОВЛЕНИЕ И ИНИЦИАЛИЗАЦИЯ ───────────────────────────────────────────
+# st_autorefresh возвращает число циклов. Если > 0, значит произошел рефреш.
+refresh_count = st_autorefresh(interval=REFRESH_MS, key="data_refresh")
 
 if "local_in_work" not in st.session_state:
     saved_in_work, saved_reviewed = load_persistent_state()
@@ -133,32 +133,49 @@ def get_worksheet() -> gspread.Worksheet:
     except gspread.WorksheetNotFound:
         return spreadsheet.get_worksheet(0)
 
-@st.cache_data(ttl=600)
-def load_data_integrated() -> tuple[pd.DataFrame, dict]:
+@st.cache_data(ttl=3600) # TTL увеличен, так как мы управляем сбросом через .clear()
+def load_data_integrated():
     sheet    = get_worksheet()
     raw_data = sheet.get_all_values()
     if not raw_data:
         return pd.DataFrame(), {}
+    
     header_idx = next(
         (i for i, row in enumerate(raw_data[:100]) if "Наименование" in row and "Склад" in row),
         -1,
     )
     if header_idx == -1: return pd.DataFrame(), {}
+    
     headers = [str(h).strip().replace("\n", " ") for h in raw_data[header_idx]]
+    
     def col_idx(name: str) -> int:
         return headers.index(name)
+    
     col_map = {
-        "ORDER": col_idx("Наименование") - 1, "PRODUCT": col_idx("Наименование"),
-        "QTY": col_idx("Кол-во"), "WH": col_idx("Склад"), "COMMENT": col_idx("Комментарий"),
-        "EDIT": col_idx("Изменения заказа"), "INWORK": col_idx("Под ЗАКАЗ"),
-        "MOVE": col_idx("Перемещение"), "DONE": col_idx("Собрано"),
+        "ORDER": col_idx("Наименование") - 1, 
+        "PRODUCT": col_idx("Наименование"),
+        "QTY": col_idx("Кол-во"), 
+        "WH": col_idx("Склад"), 
+        "COMMENT": col_idx("Комментарий"),
+        "EDIT": col_idx("Изменения заказа"), 
+        "INWORK": col_idx("Под ЗАКАЗ"),
+        "MOVE": col_idx("Перемещение"), 
+        "DONE": col_idx("Собрано"),
         "STATUS": col_idx("Статус") if "Статус" in headers else len(headers) - 1,
     }
+    
     df = pd.DataFrame(raw_data[START_ROW - 1:], columns=headers)
     df["_sheet_row"] = range(START_ROW, START_ROW + len(df))
     df = df[df[headers[col_map["PRODUCT"]]].str.strip().astype(bool)].copy()
+    
     st.session_state.last_sync = datetime.now().strftime("%H:%M:%S")
     return df, col_map
+
+# Если сработал автотаймер, очищаем кэш перед загрузкой
+if refresh_count > 0:
+    load_data_integrated.clear()
+
+# ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
 
 def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> None:
     sheet = get_worksheet()
@@ -169,12 +186,9 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
     sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
     load_data_integrated.clear()
 
-# ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
-
 def identify_target_store(comment: str) -> str:
     c = str(comment).lower()
-    if "d" in c:
-        return "Горбушка"
+    if "d" in c: return "Горбушка"
     if any(k in c for k in ["пек", "пкн", "pekin"]): return "Пекин"
     if any(k in c for k in ["горб", "грб", "gorb"]): return "Горбушка"
     return "Общий"
@@ -182,17 +196,19 @@ def identify_target_store(comment: str) -> str:
 def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
     st.table(group[table_cols].rename(columns=col_rename))
 
-# ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
+# ── ПОДГОТОВКА ДАННЫХ ─────────────────────────────────────────────────────────
 df_mem, C = load_data_integrated()
+
 if df_mem.empty or not C:
-    st.error("Не удалось загрузить данные.")
+    st.error("Не удалось загрузить данные. Проверьте таблицу.")
     st.stop()
 
 cols = df_mem.columns
 C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT = cols[C["ORDER"]], cols[C["PRODUCT"]], cols[C["QTY"]], cols[C["WH"]], cols[C["COMMENT"]]
 C_DONE, C_MOVE, C_STATUS, C_EDIT, C_INWORK = cols[C["DONE"]], cols[C["MOVE"]], cols[C["STATUS"]], cols[C["EDIT"]], cols[C["INWORK"]]
 
-TABLE_COLS, COL_RENAME = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT], {C_ORDER: "Заказ", C_PRODUCT: "Товар", C_QTY: "Кол", C_WH: "Склад", C_COMMENT: "Коммент"}
+TABLE_COLS = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT]
+COL_RENAME = {C_ORDER: "Заказ", C_PRODUCT: "Товар", C_QTY: "Кол", C_WH: "Склад", C_COMMENT: "Коммент"}
 
 current_order_ids = set(df_mem[C_ORDER].unique())
 if st.session_state.prev_order_ids:
@@ -205,26 +221,34 @@ work_base["_target_store"] = work_base[C_COMMENT].apply(identify_target_store)
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
-menu = st.sidebar.selectbox("Выберите раздел:", ["🏪 Магазин: ГОРБУШКА", "🏪 Магазин: ПЕКИН", "🚚 Перемещения (Активные)", "⏳ Товар Под заказ", "✅ Выполненные сборки", "🚫 Отмененные заказы"])
+menu = st.sidebar.selectbox("Выберите раздел:", [
+    "🏪 Магазин: ГОРБУШКА", 
+    "🏪 Магазин: ПЕКИН", 
+    "🚚 Перемещения (Активные)", 
+    "⏳ Товар Под заказ", 
+    "✅ Выполненные сборки", 
+    "🚫 Отмененные заказы"
+])
 
 if st.sidebar.button("🚪 Выйти"):
     cookie_manager.delete(COOKIE_NAME)
     st.session_state.password_correct = False
     st.rerun()
 
-st.sidebar.caption(f"🔄 Синхронизация: {st.session_state.last_sync}")
-if st.sidebar.button("🔃 Обновить вручную"):
+st.sidebar.markdown("---")
+st.sidebar.caption(f"🔄 Последняя синхронизация: **{st.session_state.last_sync}**")
+if st.sidebar.button("🔃 Обновить данные сейчас"):
     load_data_integrated.clear()
     st.rerun()
 
-# ── РАЗДЕЛ: МАГАЗИН ───────────────────────────────────────────────────────────
+# ── ЛОГИКА ОТОБРАЖЕНИЯ МАГАЗИНА ───────────────────────────────────────────────
 
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
 
     store_new_alert = {oid for oid in st.session_state.new_orders_alert if oid in work_base[C_ORDER].values}
     if store_new_alert:
-        st.success(f"🆕 Новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
+        st.success(f"🆕 Обнаружены новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
     
     if current_store == "Горбушка":
         wh_match = work_base[C_WH].str.contains("Горб|Сток", case=False, na=False)
@@ -238,6 +262,7 @@ def render_store(current_store: str) -> None:
     is_incoming = is_move & (work_base["_target_store"] == current_store)
 
     display_df = work_base[((is_f_match | is_pz_match) & ~is_move) | is_incoming].copy()
+    # Фильтр: не собрано ИЛИ есть правки, которые еще не подтверждены
     display_df = display_df[(display_df[C_DONE] != TRUE_VAL) | ((display_df[C_EDIT] != "") & (~display_df[C_ORDER].isin(st.session_state.reviewed_changes)))]
 
     col1, col2 = st.columns(2)
@@ -319,19 +344,20 @@ def render_store(current_store: str) -> None:
                         st.rerun()
 
 # ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
+
 if "Магазин" in menu:
     render_store("Горбушка" if "ГОРБУШКА" in menu else "Пекин")
 elif menu == "🚚 Перемещения (Активные)":
     st.title("🚚 В пути")
     moves = work_base[work_base[C_MOVE] == TRUE_VAL]
     for oid, group in moves.groupby(C_ORDER, sort=False):
-        with st.expander(f"Перемещение №{oid}"):
+        with st.expander(f"Перемещение №{oid} ⮕ {group['_target_store'].iloc[0]}"):
             render_order_table(group, TABLE_COLS, COL_RENAME)
-            if st.button("Удалить из списка", key=f"cl_mv_{oid}"):
+            if st.button("Сбросить статус перемещения", key=f"cl_mv_{oid}"):
                 update_google_cells(group, C, {"MOVE": FALSE_VAL})
                 st.rerun()
 elif menu == "⏳ Товар Под заказ":
-    st.title("⏳ Ожидание ПЗ")
+    st.title("⏳ Ожидание поступления (ПЗ)")
     pz = work_base[work_base[C_WH].isin(PZ_LIST) & (work_base[C_INWORK] != TRUE_VAL) & (work_base[C_DONE] != TRUE_VAL)]
     st.dataframe(pz[TABLE_COLS].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
 elif menu == "✅ Выполненные сборки":
