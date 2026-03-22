@@ -384,8 +384,12 @@ def render_store(current_store: str) -> None:
     )
     is_incoming  = is_move & (work_base["_target_store"] == current_store)
 
-    # Отменённые заказы этого магазина (показываем даже если done=TRUE)
-    is_cancelled_store = work_base["_is_cancelled"] & (is_f_match | is_pz_match | is_incoming)
+    # Отменённые заказы этого магазина — только неподтверждённые (DONE != TRUE)
+    is_cancelled_store = (
+        work_base["_is_cancelled"]
+        & (is_f_match | is_pz_match | is_incoming)
+        & (work_base[C_DONE] != TRUE_VAL)
+    )
 
     base_mask    = ((is_f_match | is_pz_match) & ~is_move) | is_incoming
     reviewed     = st.session_state.reviewed_changes
