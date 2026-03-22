@@ -124,39 +124,75 @@ def _get_state_worksheet() -> gspread.Worksheet:
     try:
         return ss.worksheet(STATE_TAB_NAME)
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(STATE_TAB_NAME, rows=5000, cols=2)
-        ws.update([["local_in_work", "reviewed_changes"]], value_input_option="RAW")
+        ws = ss.add_worksheet(STATE_TAB_NAME, rows=5000, cols=4)
+        ws.update(
+            [["local_in_work", "reviewed_changes", "confirmed_cancels", "completed_log"]],
+            value_input_option="RAW",
+        )
         return ws
 
 
-def load_persistent_state() -> tuple[set, set]:
+def load_persistent_state() -> tuple[set, set, set, list]:
+    """
+    Загружает из Sheets:
+      - local_in_work      (col 0)
+      - reviewed_changes   (col 1)
+      - confirmed_cancels  (col 2)
+      - completed_log      (col 3) — список строк "timestamp|oid|product|qty|store"
+    """
     try:
         rows = _get_state_worksheet().get_all_values()
         if len(rows) < 2:
-            return set(), set()
-        in_work  = {r[0] for r in rows[1:] if r[0].strip()}
-        reviewed = {r[1] for r in rows[1:] if len(r) > 1 and r[1].strip()}
-        return in_work, reviewed
+            return set(), set(), set(), []
+        in_work   = {r[0] for r in rows[1:] if r[0].strip()}
+        reviewed  = {r[1] for r in rows[1:] if len(r) > 1 and r[1].strip()}
+        confirmed = {r[2] for r in rows[1:] if len(r) > 2 and r[2].strip()}
+        log       = [r[3] for r in rows[1:] if len(r) > 3 and r[3].strip()]
+        return in_work, reviewed, confirmed, log
     except Exception as e:
         st.warning(f"Не удалось загрузить состояние из Sheets: {e}")
-        return set(), set()
+        return set(), set(), set(), []
 
 
 def save_persistent_state() -> None:
+    """
+    Сохраняет все четыре колонки состояния в один лист avenue_state.
+    completed_log хранит историю завершённых и отменённых взаимодействий —
+    каждая запись: "timestamp|oid|product|qty|store|action"
+    action = "done" | "cancel_confirmed"
+    """
     try:
-        ws       = _get_state_worksheet()
-        in_work  = list(st.session_state.local_in_work)
-        reviewed = list(st.session_state.reviewed_changes)
-        max_len  = max(len(in_work), len(reviewed), 1)
-        in_work  += [""] * (max_len - len(in_work))
-        reviewed += [""] * (max_len - len(reviewed))
+        ws        = _get_state_worksheet()
+        in_work   = list(st.session_state.local_in_work)
+        reviewed  = list(st.session_state.reviewed_changes)
+        confirmed = list(st.session_state.confirmed_cancels)
+        log       = list(st.session_state.completed_log)
+        max_len   = max(len(in_work), len(reviewed), len(confirmed), len(log), 1)
+        in_work   += [""] * (max_len - len(in_work))
+        reviewed  += [""] * (max_len - len(reviewed))
+        confirmed += [""] * (max_len - len(confirmed))
+        log       += [""] * (max_len - len(log))
         ws.clear()
         ws.update(
-            [["local_in_work", "reviewed_changes"]] + list(zip(in_work, reviewed)),
+            [["local_in_work", "reviewed_changes", "confirmed_cancels", "completed_log"]]
+            + list(zip(in_work, reviewed, confirmed, log)),
             value_input_option="RAW",
         )
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
+
+
+def _log_action(oid, group: pd.DataFrame, store: str, action: str) -> None:
+    """
+    Записывает событие в completed_log.
+    Формат строки: "2024-01-15 14:32|ОЗ-001|Товар А;Товар Б|2;1|Горбушка|done"
+    action: "done" | "cancel_confirmed"
+    """
+    ts       = datetime.now().strftime("%Y-%m-%d %H:%M")
+    products = ";".join(group[C_PRODUCT].astype(str).tolist())
+    qtys     = ";".join(group[C_QTY].astype(str).tolist())
+    entry    = f"{ts}|{oid}|{products}|{qtys}|{store}|{action}"
+    st.session_state.completed_log.append(entry)
 
 
 # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
@@ -204,13 +240,14 @@ def _build_tags(
 refresh_count = st_autorefresh(interval=REFRESH_MS, key="data_refresh")
 
 if "local_in_work" not in st.session_state:
-    saved_in_work, saved_reviewed = load_persistent_state()
+    saved_in_work, saved_reviewed, saved_confirmed, saved_log = load_persistent_state()
     st.session_state.local_in_work     = saved_in_work
     st.session_state.reviewed_changes  = saved_reviewed
+    st.session_state.confirmed_cancels = saved_confirmed   # ← персистентно из Sheets
+    st.session_state.completed_log     = saved_log         # ← история взаимодействий
     st.session_state.prev_order_ids    = set()
     st.session_state.new_orders_alert  = set()
     st.session_state.last_sync         = "Не обновлялось"
-    st.session_state.confirmed_cancels = set()
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 
@@ -378,11 +415,14 @@ def render_store(current_store: str) -> None:
     )
     is_incoming = is_move & (work_base["_target_store"] == current_store)
 
-    _confirmed = st.session_state.confirmed_cancels
+    # ── ИСПРАВЛЕНИЕ: убрали C_DONE != TRUE_VAL ──────────────────────────────
+    # Отменённые заказы показываем на главном экране независимо от статуса сборки,
+    # пока пользователь явно не подтвердит отмену.
+    _confirmed = {str(x) for x in st.session_state.confirmed_cancels}
+
     is_cancelled_store = (
         work_base["_is_cancelled"]
         & (is_f_match | is_pz_match | is_incoming)
-        & (work_base[C_DONE] != TRUE_VAL)
         & (~work_base[C_ORDER].astype(str).isin(_confirmed))
     )
 
@@ -446,6 +486,8 @@ def render_store(current_store: str) -> None:
                     update_google_cells(group, C, {"DONE": TRUE_VAL})
                     st.session_state.confirmed_cancels.add(str(oid))
                     st.session_state.local_in_work.discard(oid)
+                    # ── Логируем подтверждение отмены ───────────────────────
+                    _log_action(oid, group, current_store, "cancel_confirmed")
                     save_persistent_state()
                     st.rerun()
 
@@ -475,6 +517,8 @@ def render_store(current_store: str) -> None:
                         update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
                         st.session_state.local_in_work.discard(oid)
                         st.session_state.reviewed_changes.discard(_review_key(oid, edit_text))
+                        # ── Логируем завершение сборки ───────────────────────
+                        _log_action(oid, group, current_store, "done")
                         save_persistent_state()
                         st.rerun()
 
@@ -547,9 +591,16 @@ elif menu == "✅ Выполненные сборки":
     )
 
 elif menu == "🚫 Отмененные заказы":
-    st.title("🚫 Отменённые")
-    cancelled = work_base[work_base["_is_cancelled"]]
-    st.dataframe(
-        cancelled[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME),
-        use_container_width=True, hide_index=True,
-    )
+    st.title("🚫 Отменённые (подтверждённые)")
+    _confirmed = {str(x) for x in st.session_state.confirmed_cancels}
+    cancelled  = work_base[
+        work_base["_is_cancelled"]
+        & work_base[C_ORDER].astype(str).isin(_confirmed)
+    ]
+    if cancelled.empty:
+        st.info("Подтверждённых отмен пока нет.")
+    else:
+        st.dataframe(
+            cancelled[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME),
+            use_container_width=True, hide_index=True,
+        )
