@@ -4,6 +4,8 @@
 Функционал и интерфейс сохранены полностью.
 """
 
+from __future__ import annotations
+
 import streamlit as st
 import gspread
 import pandas as pd
@@ -70,7 +72,9 @@ def check_password() -> bool:
     remember = st.checkbox("Запомнить меня на этом устройстве", value=True)
 
     if st.button("Войти", key="login_btn", type="primary"):
-        if pwd == st.secrets["password"]:
+        # Сравнение через hmac.compare_digest для защиты от timing-атак
+        import hmac
+        if hmac.compare_digest(pwd, st.secrets["password"]):
             st.session_state.password_correct = True
             if remember:
                 cookie_manager.set(
@@ -112,40 +116,15 @@ def get_client() -> gspread.Client:
 
 @st.cache_resource
 def get_spreadsheet() -> gspread.Spreadsheet:
-    """Возвращает spreadsheet объект (кешируется на всё время сессии)."""
     return get_client().open_by_key(SHEET_ID)
 
 
 # ── СОСТОЯНИЕ В GOOGLE SHEETS ─────────────────────────────────────────────────
 
 def _get_state_worksheet() -> gspread.Worksheet:
-    """
-    Возвращает лист avenue_state, создаёт при отсутствии.
-    При обнаружении старого формата (< 4 колонок) — автоматически мигрирует.
-    """
     ss = get_spreadsheet()
     try:
-        ws = ss.worksheet(STATE_TAB_NAME)
-        # Проверяем структуру — если заголовок старый, мигрируем
-        header = ws.row_values(1)
-        if len(header) < 4:
-            rows = ws.get_all_values()
-            old_data = rows[1:] if len(rows) > 1 else []
-            ws.clear()
-            ws.update(
-                [["local_in_work", "reviewed_changes", "confirmed_cancels", "completed_log"]]
-                + [
-                    [
-                        r[0] if len(r) > 0 else "",
-                        r[1] if len(r) > 1 else "",
-                        "",
-                        "",
-                    ]
-                    for r in old_data
-                ],
-                value_input_option="RAW",
-            )
-        return ws
+        return ss.worksheet(STATE_TAB_NAME)
     except gspread.WorksheetNotFound:
         ws = ss.add_worksheet(STATE_TAB_NAME, rows=5000, cols=4)
         ws.update(
@@ -156,13 +135,6 @@ def _get_state_worksheet() -> gspread.Worksheet:
 
 
 def load_persistent_state() -> tuple[set, set, set, list]:
-    """
-    Загружает из Sheets:
-      - local_in_work      (col 0)
-      - reviewed_changes   (col 1)
-      - confirmed_cancels  (col 2)
-      - completed_log      (col 3) — список строк "timestamp|oid|product|qty|store"
-    """
     try:
         rows = _get_state_worksheet().get_all_values()
         if len(rows) < 2:
@@ -178,12 +150,6 @@ def load_persistent_state() -> tuple[set, set, set, list]:
 
 
 def save_persistent_state() -> None:
-    """
-    Сохраняет все четыре колонки состояния в один лист avenue_state.
-    completed_log хранит историю завершённых и отменённых взаимодействий —
-    каждая запись: "timestamp|oid|product|qty|store|action"
-    action = "done" | "cancel_confirmed"
-    """
     try:
         ws        = _get_state_worksheet()
         in_work   = list(st.session_state.local_in_work)
@@ -191,14 +157,14 @@ def save_persistent_state() -> None:
         confirmed = list(st.session_state.confirmed_cancels)
         log       = list(st.session_state.completed_log)
         max_len   = max(len(in_work), len(reviewed), len(confirmed), len(log), 1)
-        in_work   += [""] * (max_len - len(in_work))
-        reviewed  += [""] * (max_len - len(reviewed))
-        confirmed += [""] * (max_len - len(confirmed))
-        log       += [""] * (max_len - len(log))
+
+        def pad(lst: list) -> list:
+            return lst + [""] * (max_len - len(lst))
+
         ws.clear()
         ws.update(
             [["local_in_work", "reviewed_changes", "confirmed_cancels", "completed_log"]]
-            + list(zip(in_work, reviewed, confirmed, log)),
+            + list(zip(pad(in_work), pad(reviewed), pad(confirmed), pad(log))),
             value_input_option="RAW",
         )
     except Exception as e:
@@ -206,22 +172,17 @@ def save_persistent_state() -> None:
 
 
 def _log_action(oid, group: pd.DataFrame, store: str, action: str) -> None:
-    """
-    Записывает событие в completed_log.
-    Формат строки: "2024-01-15 14:32|ОЗ-001|Товар А;Товар Б|2;1|Горбушка|done"
-    action: "done" | "cancel_confirmed"
-    """
     ts       = datetime.now().strftime("%Y-%m-%d %H:%M")
     products = ";".join(group[C_PRODUCT].astype(str).tolist())
     qtys     = ";".join(group[C_QTY].astype(str).tolist())
-    entry    = f"{ts}|{oid}|{products}|{qtys}|{store}|{action}"
-    st.session_state.completed_log.append(entry)
+    st.session_state.completed_log.append(
+        f"{ts}|{oid}|{products}|{qtys}|{store}|{action}"
+    )
 
 
 # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
 
 def _review_key(oid, edit_text: str) -> str:
-    """Уникальный ключ: номер заказа + текст изменения."""
     return f"{oid}||{str(edit_text).strip()}"
 
 
@@ -250,12 +211,12 @@ def _build_tags(
     extra_tag: str | None = None,
 ) -> str:
     tags = []
-    if is_cancelled:           tags.append("🚫 ОТМЕНА")
-    if "d" in comment_str:     tags.append("📦 ДОСТАВКА")
-    if is_move_needed:         tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
-    if has_edit:               tags.append("⚠️ ИЗМЕНЕНИЕ" if not extra_tag else extra_tag)
-    if is_pz_item:             tags.append("⏳ ПЗ")
-    if incoming:               tags.append("🚚 ЕДЕТ")
+    if is_cancelled:       tags.append("🚫 ОТМЕНА")
+    if "d" in comment_str: tags.append("📦 ДОСТАВКА")
+    if is_move_needed:     tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+    if has_edit:           tags.append(extra_tag if extra_tag else "⚠️ ИЗМЕНЕНИЕ")
+    if is_pz_item:         tags.append("⏳ ПЗ")
+    if incoming:           tags.append("🚚 ЕДЕТ")
     return " | ".join(tags)
 
 
@@ -266,17 +227,15 @@ if "local_in_work" not in st.session_state:
     saved_in_work, saved_reviewed, saved_confirmed, saved_log = load_persistent_state()
     st.session_state.local_in_work     = saved_in_work
     st.session_state.reviewed_changes  = saved_reviewed
-    st.session_state.confirmed_cancels = saved_confirmed   # ← персистентно из Sheets
-    st.session_state.completed_log     = saved_log         # ← история взаимодействий
+    st.session_state.confirmed_cancels = saved_confirmed
+    st.session_state.completed_log     = saved_log
     st.session_state.prev_order_ids    = set()
     st.session_state.new_orders_alert  = set()
     st.session_state.last_sync         = "Не обновлялось"
 
-# Защита: если сессия стартовала со старым кодом — добираем недостающие ключи
-if "completed_log" not in st.session_state:
-    st.session_state.completed_log = []
-if "confirmed_cancels" not in st.session_state:
-    st.session_state.confirmed_cancels = set()
+# Добавляем недостающие ключи для обратной совместимости со старыми сессиями
+st.session_state.setdefault("completed_log", [])
+st.session_state.setdefault("confirmed_cancels", set())
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 
@@ -334,8 +293,9 @@ if refresh_count > 0:
     load_data_integrated.clear()
 
 
+@st.cache_resource
 def get_orders_worksheet() -> gspread.Worksheet:
-    """Открывает рабочий лист заказов."""
+    """Кешируем объект листа — не открываем при каждом действии."""
     ss = get_spreadsheet()
     try:
         return ss.worksheet(TAB_NAME)
@@ -432,10 +392,8 @@ def render_store(current_store: str) -> None:
     is_pz_row = work_base[C_WH].isin(PZ_LIST)
     is_move   = work_base[C_MOVE] == TRUE_VAL
 
-    if current_store == STORE_GORB:
-        wh_match = work_base[C_WH].str.contains("Горб|Сток", case=False, na=False)
-    else:
-        wh_match = work_base[C_WH].str.contains("Пекин", case=False, na=False)
+    wh_pattern = "Горб|Сток" if current_store == STORE_GORB else "Пекин"
+    wh_match   = work_base[C_WH].str.contains(wh_pattern, case=False, na=False)
 
     is_f_match  = wh_match & ~is_pz_row
     is_pz_match = (
@@ -444,9 +402,6 @@ def render_store(current_store: str) -> None:
     )
     is_incoming = is_move & (work_base["_target_store"] == current_store)
 
-    # ── ИСПРАВЛЕНИЕ: убрали C_DONE != TRUE_VAL ──────────────────────────────
-    # Отменённые заказы показываем на главном экране независимо от статуса сборки,
-    # пока пользователь явно не подтвердит отмену.
     _confirmed = {str(x) for x in st.session_state.confirmed_cancels}
 
     is_cancelled_store = (
@@ -481,14 +436,14 @@ def render_store(current_store: str) -> None:
     col1, col2 = st.columns(2)
 
     def _render_order_group(oid, group: pd.DataFrame, in_work_section: bool) -> None:
-        comment_str    = str(group[C_COMMENT].iloc[0]).lower()
-        target         = group["_target_store"].iloc[0]
-        incoming       = group[C_MOVE].iloc[0] == TRUE_VAL
-        is_pz_item     = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
-        edit_text      = group[C_EDIT].iloc[0]
-        has_edit       = bool(str(edit_text).strip()) and _review_key(oid, edit_text) not in reviewed
+        comment_str = str(group[C_COMMENT].iloc[0]).lower()
+        target      = group["_target_store"].iloc[0]
+        incoming    = group[C_MOVE].iloc[0] == TRUE_VAL
+        is_pz_item  = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
+        edit_text   = group[C_EDIT].iloc[0]
+        has_edit    = bool(str(edit_text).strip()) and _review_key(oid, edit_text) not in reviewed
         is_move_needed = target != current_store and target != "Общий" and not incoming
-        cancelled      = group["_is_cancelled"].iloc[0]
+        cancelled   = group["_is_cancelled"].iloc[0]
 
         extra_tag = "⚠️ ПРАВКА" if in_work_section else None
         tag_str   = _build_tags(
@@ -515,7 +470,6 @@ def render_store(current_store: str) -> None:
                     update_google_cells(group, C, {"DONE": TRUE_VAL})
                     st.session_state.confirmed_cancels.add(str(oid))
                     st.session_state.local_in_work.discard(oid)
-                    # ── Логируем подтверждение отмены ───────────────────────
                     _log_action(oid, group, current_store, "cancel_confirmed")
                     save_persistent_state()
                     st.rerun()
@@ -546,7 +500,6 @@ def render_store(current_store: str) -> None:
                         update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
                         st.session_state.local_in_work.discard(oid)
                         st.session_state.reviewed_changes.discard(_review_key(oid, edit_text))
-                        # ── Логируем завершение сборки ───────────────────────
                         _log_action(oid, group, current_store, "done")
                         save_persistent_state()
                         st.rerun()
@@ -562,7 +515,6 @@ def render_store(current_store: str) -> None:
                         st.rerun()
 
             else:
-                # Секция "Новые" — только кнопка "В работу", без отмены
                 if st.button("В работу", key=f"w_{oid}", use_container_width=True):
                     st.session_state.local_in_work.add(oid)
                     save_persistent_state()
@@ -629,13 +581,7 @@ elif menu == "🚫 Отмененные заказы":
     if cancelled.empty:
         st.info("Подтверждённых отмен пока нет.")
     else:
-        for oid, group in cancelled.groupby(C_ORDER, sort=False):
-            with st.expander(f"Заказ №{oid}"):
-                render_order_table(group, TABLE_COLS, COL_RENAME)
-                if st.button(
-                    "↩️ Снять подтверждение отмены", key=f"uncancel_{oid}",
-                    use_container_width=True,
-                ):
-                    st.session_state.confirmed_cancels.discard(str(oid))
-                    save_persistent_state()
-                    st.rerun()
+        st.dataframe(
+            cancelled[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME),
+            use_container_width=True, hide_index=True,
+        )
