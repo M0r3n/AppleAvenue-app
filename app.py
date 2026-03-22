@@ -28,6 +28,7 @@ REFRESH_MS     = 600_000
 PREVIEW_ORDERS = 50
 STORE_GORB     = "Горбушка"
 STORE_PEKIN    = "Пекин"
+CANCELLED_VAL  = "Отменён"  # значение, которое пишем в столбец STATUS при отмене
 
 _PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
 _GORB_KEYWORDS  = ("горб", "грб", "gorb")
@@ -186,15 +187,26 @@ def _build_tags(
     has_edit: bool,
     is_pz_item: bool,
     incoming: bool,
+    is_cancelled: bool = False,
     extra_tag: Optional[str] = None,
 ) -> str:
     tags = []
-    if "d" in comment_str:  tags.append("📦 ДОСТАВКА")
-    if is_move_needed:       tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
-    if has_edit:             tags.append("⚠️ ИЗМЕНЕНИЕ" if not extra_tag else extra_tag)
-    if is_pz_item:           tags.append("⏳ ПЗ")
-    if incoming:             tags.append("🚚 ЕДЕТ")
+    if is_cancelled:             tags.append("🚫 ОТМЕНА")
+    if "d" in comment_str:       tags.append("📦 ДОСТАВКА")
+    if is_move_needed:           tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+    if has_edit:                 tags.append("⚠️ ИЗМЕНЕНИЕ" if not extra_tag else extra_tag)
+    if is_pz_item:               tags.append("⏳ ПЗ")
+    if incoming:                 tags.append("🚚 ЕДЕТ")
     return " | ".join(tags)
+
+
+def _is_cancelled(row_or_group) -> bool:
+    """Проверяет, отменён ли заказ по значению столбца STATUS."""
+    if isinstance(row_or_group, pd.DataFrame):
+        val = row_or_group[C_STATUS].iloc[0]
+    else:
+        val = row_or_group
+    return str(val).strip().lower() == CANCELLED_VAL.lower()
 
 
 # ── АВТООБНОВЛЕНИЕ И ИНИЦИАЛИЗАЦИЯ ───────────────────────────────────────────
@@ -320,9 +332,11 @@ if st.session_state.prev_order_ids:
         st.session_state.new_orders_alert = new_ids
 st.session_state.prev_order_ids = current_order_ids
 
-# Базовый фильтр: без отменённых + целевой магазин
-work_base = df_mem[~df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)].copy()
+# ── ИЗМЕНЕНИЕ: work_base теперь включает отменённые заказы ────────────────────
+# Убираем фильтр ~отмен — отменённые должны отображаться в интерфейсе с плашкой
+work_base = df_mem.copy()
 work_base["_target_store"] = work_base[C_COMMENT].apply(identify_target_store)
+work_base["_is_cancelled"] = work_base[C_STATUS].str.strip().str.lower() == CANCELLED_VAL.lower()
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
@@ -369,6 +383,10 @@ def render_store(current_store: str) -> None:
         & (work_base[C_INWORK] == TRUE_VAL)
     )
     is_incoming  = is_move & (work_base["_target_store"] == current_store)
+
+    # Отменённые заказы этого магазина (показываем даже если done=TRUE)
+    is_cancelled_store = work_base["_is_cancelled"] & (is_f_match | is_pz_match | is_incoming)
+
     base_mask    = ((is_f_match | is_pz_match) & ~is_move) | is_incoming
     reviewed     = st.session_state.reviewed_changes
 
@@ -383,8 +401,10 @@ def render_store(current_store: str) -> None:
         index=work_base.index,
     )
 
+    # Основной пул: незавершённые + непросмотренные изменения + отменённые этого магазина
     display_df = work_base[
-        base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev)
+        (base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev))
+        | is_cancelled_store
     ].copy()
 
     col1, col2 = st.columns(2)
@@ -397,18 +417,30 @@ def render_store(current_store: str) -> None:
         edit_text      = group[C_EDIT].iloc[0]
         has_edit       = bool(str(edit_text).strip()) and _review_key(oid, edit_text) not in reviewed
         is_move_needed = target != current_store and target != "Общий" and not incoming
+        cancelled      = group["_is_cancelled"].iloc[0]
 
         extra_tag = "⚠️ ПРАВКА" if in_work_section else None
-        tag_str   = _build_tags(comment_str, is_move_needed, has_edit, is_pz_item, incoming, extra_tag)
+        tag_str   = _build_tags(
+            comment_str, is_move_needed, has_edit,
+            is_pz_item, incoming, cancelled, extra_tag
+        )
         label     = f"Заказ №{oid}{f' [{tag_str}]' if tag_str else ''}"
 
+        # Для отменённых — особый стиль экспандера
         with st.expander(label):
+            if cancelled:
+                st.error("🚫 Этот заказ отменён")
+
             if has_edit:
                 prefix = "Правка" if in_work_section else "Изменение"
                 st.error(f"{prefix}: {edit_text}")
+
             render_order_table(group, TABLE_COLS, COL_RENAME)
 
-            if has_edit:
+            if cancelled:
+                # Для отменённых — никаких кнопок действий, заказ уже в финальном статусе
+                st.caption("Заказ перемещён в раздел «Отменённые заказы»")
+            elif has_edit:
                 btn_label = "Учесть правку" if in_work_section else "Учесть Изменение"
                 if st.button(btn_label, key=f"rev_{'w' if in_work_section else 'n'}_{oid}"):
                     st.session_state.reviewed_changes.add(_review_key(oid, edit_text))
@@ -425,6 +457,7 @@ def render_store(current_store: str) -> None:
                         save_persistent_state()
                         st.rerun()
                 else:
+                    # Кнопки действия + кнопка отмены заказа
                     action_label = "✅ ПРИНЯТО И СОБРАНО" if incoming else "✅ ЗАВЕРШИТЬ СБОРКУ"
                     if st.button(
                         action_label, key=f"dn_{oid}",
@@ -435,11 +468,31 @@ def render_store(current_store: str) -> None:
                         st.session_state.reviewed_changes.discard(_review_key(oid, edit_text))
                         save_persistent_state()
                         st.rerun()
+
+                    st.markdown("---")
+                    if st.button(
+                        "🚫 Отменить заказ", key=f"cancel_{oid}",
+                        use_container_width=True,
+                    ):
+                        update_google_cells(group, C, {"STATUS": CANCELLED_VAL})
+                        st.session_state.local_in_work.discard(oid)
+                        save_persistent_state()
+                        st.rerun()
             else:
-                if st.button("В работу", key=f"w_{oid}"):
-                    st.session_state.local_in_work.add(oid)
-                    save_persistent_state()
-                    st.rerun()
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+                    if st.button("В работу", key=f"w_{oid}", use_container_width=True):
+                        st.session_state.local_in_work.add(oid)
+                        save_persistent_state()
+                        st.rerun()
+                with col_btn2:
+                    if st.button(
+                        "🚫 Отменить", key=f"cancel_new_{oid}",
+                        use_container_width=True,
+                    ):
+                        update_google_cells(group, C, {"STATUS": CANCELLED_VAL})
+                        save_persistent_state()
+                        st.rerun()
 
     with col1:
         st.subheader("🆕 Новые / Изменения")
@@ -475,6 +528,7 @@ elif menu == "⏳ Товар Под заказ":
         work_base[C_WH].isin(PZ_LIST)
         & (work_base[C_INWORK] != TRUE_VAL)
         & (work_base[C_DONE] != TRUE_VAL)
+        & (~work_base["_is_cancelled"])
     ]
     st.dataframe(
         pz[TABLE_COLS].rename(columns=COL_RENAME),
@@ -483,15 +537,17 @@ elif menu == "⏳ Товар Под заказ":
 
 elif menu == "✅ Выполненные сборки":
     st.title("✅ Последние собранные")
-    done = work_base[work_base[C_DONE] == TRUE_VAL].iloc[::-1].head(PREVIEW_ORDERS)
+    done = work_base[
+        (work_base[C_DONE] == TRUE_VAL) & (~work_base["_is_cancelled"])
+    ].iloc[::-1].head(PREVIEW_ORDERS)
     st.dataframe(
         done[TABLE_COLS].rename(columns=COL_RENAME),
         use_container_width=True, hide_index=True,
     )
 
 elif menu == "🚫 Отмененные заказы":
-    st.title("🚫 Отмененные")
-    cancelled = df_mem[df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)]
+    st.title("🚫 Отменённые")
+    cancelled = work_base[work_base["_is_cancelled"]]
     st.dataframe(
         cancelled[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME),
         use_container_width=True, hide_index=True,
