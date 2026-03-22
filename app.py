@@ -134,19 +134,33 @@ def _get_state_worksheet() -> gspread.Worksheet:
         return ws
 
 
-def load_persistent_state() -> tuple[set, set, set, list]:
+# ── ЗАГРУЗКА local_in_work из Sheets с коротким TTL (синхронизация между устройствами) ──
+
+@st.cache_data(ttl=15)
+def load_in_work_from_sheets() -> set:
+    """Загружает актуальный список заказов в работе. TTL=15 сек — быстрая синхронизация."""
     try:
         rows = _get_state_worksheet().get_all_values()
         if len(rows) < 2:
-            return set(), set(), set(), []
-        in_work   = {r[0] for r in rows[1:] if r[0].strip()}
+            return set()
+        return {r[0] for r in rows[1:] if r[0].strip()}
+    except Exception:
+        return set()
+
+
+def load_persistent_state() -> tuple[set, set, list]:
+    """Загружает reviewed_changes, confirmed_cancels, completed_log (без in_work — он отдельно)."""
+    try:
+        rows = _get_state_worksheet().get_all_values()
+        if len(rows) < 2:
+            return set(), set(), []
         reviewed  = {r[1] for r in rows[1:] if len(r) > 1 and r[1].strip()}
         confirmed = {r[2] for r in rows[1:] if len(r) > 2 and r[2].strip()}
         log       = [r[3] for r in rows[1:] if len(r) > 3 and r[3].strip()]
-        return in_work, reviewed, confirmed, log
+        return reviewed, confirmed, log
     except Exception as e:
         st.warning(f"Не удалось загрузить состояние из Sheets: {e}")
-        return set(), set(), set(), []
+        return set(), set(), []
 
 
 def save_persistent_state() -> None:
@@ -167,6 +181,8 @@ def save_persistent_state() -> None:
             + list(zip(pad(in_work), pad(reviewed), pad(confirmed), pad(log))),
             value_input_option="RAW",
         )
+        # Сбрасываем кеш — другие устройства сразу увидят изменения (макс. 15 сек)
+        load_in_work_from_sheets.clear()
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
 
@@ -220,7 +236,7 @@ def _build_tags(
     return " | ".join(tags)
 
 
-# ── АВТООБНОВЛЕНИЕ И ИНИЦИАЛИЗАЦИЯ ───────────────────────────────────────────
+# ── АВТООБНОВЛЕНИЕ ────────────────────────────────────────────────────────────
 st.session_state.setdefault("auto_refresh_enabled", True)
 
 refresh_count = st_autorefresh(
@@ -228,9 +244,9 @@ refresh_count = st_autorefresh(
     key="data_refresh",
 ) if st.session_state.auto_refresh_enabled else 0
 
-if "local_in_work" not in st.session_state:
-    saved_in_work, saved_reviewed, saved_confirmed, saved_log = load_persistent_state()
-    st.session_state.local_in_work     = saved_in_work
+# ── ИНИЦИАЛИЗАЦИЯ СЕССИИ ─────────────────────────────────────────────────────
+if "reviewed_changes" not in st.session_state:
+    saved_reviewed, saved_confirmed, saved_log = load_persistent_state()
     st.session_state.reviewed_changes  = saved_reviewed
     st.session_state.confirmed_cancels = saved_confirmed
     st.session_state.completed_log     = saved_log
@@ -241,6 +257,9 @@ if "local_in_work" not in st.session_state:
 # Добавляем недостающие ключи для обратной совместимости со старыми сессиями
 st.session_state.setdefault("completed_log", [])
 st.session_state.setdefault("confirmed_cancels", set())
+
+# local_in_work всегда берётся из Sheets (TTL 15 сек) — синхронизация между устройствами
+st.session_state.local_in_work = load_in_work_from_sheets()
 
 # ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 
@@ -386,6 +405,7 @@ st.sidebar.caption(f"🔄 Последняя синхронизация: **{st.s
 
 if st.sidebar.button("🔃 Обновить данные сейчас"):
     load_data_integrated.clear()
+    load_in_work_from_sheets.clear()
     st.rerun()
 
 # ── ЛОГИКА ОТОБРАЖЕНИЯ МАГАЗИНА ───────────────────────────────────────────────
