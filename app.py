@@ -30,7 +30,9 @@ REFRESH_MS     = 600_000   # 10 минут
 PREVIEW_ORDERS = 50
 STORE_GORB     = "Горбушка"
 STORE_PEKIN    = "Пекин"
+STORE_TIK      = "ТИК"
 CANCELLED_VAL  = "Отменён"
+STORE_TIK      = "ТИК"
 STATE_SYNC_TTL = 15        # секунд между синхронизациями состояния
 
 _PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
@@ -266,8 +268,9 @@ def _review_key(oid, edit_text: str) -> str:
 def identify_target_store(comment: str) -> str:
     """
     Определяет магазин-получатель по тексту комментария.
-    Если комментарий содержит "d" — это доставка, которая всегда идёт на Горбушку.
-    Если товар с разных складов (Пекин/ТИК) — нужно перемещение на Горбушку.
+    'd' в комментарии → доставка → всегда Горбушка.
+    Иначе по ключевым словам Пекина / Горбушки.
+    Используется и для обычных складов, и для ТИК.
     """
     c = str(comment).lower()
     if "d" in c:
@@ -292,15 +295,17 @@ def _build_tags(
     incoming: bool,
     is_cancelled: bool = False,
     in_work_section: bool = False,
+    is_tik_pending: bool = False,
 ) -> str:
     tags = []
-    if is_cancelled:            tags.append("🚫 ОТМЕНА")
+    if is_cancelled:             tags.append("🚫 ОТМЕНА")
     if is_delivery(comment_str): tags.append("📦 ДОСТАВКА")
-    if is_move_needed:          tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
+    if is_tik_pending:           tags.append("🏭 ТИК → ждёт отправки")
+    if is_move_needed:           tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
     if has_edit:
         tags.append("⚠️ ПРАВКА" if in_work_section else "⚠️ ИЗМЕНЕНИЕ")
-    if is_pz_item:              tags.append("⏳ ПЗ")
-    if incoming:                tags.append("🚚 ЕДЕТ")
+    if is_pz_item:               tags.append("⏳ ПЗ")
+    if incoming:                 tags.append("🚚 ЕДЕТ")
     return " | ".join(tags)
 
 
@@ -444,15 +449,23 @@ def render_store(current_store: str) -> None:
     )
     is_incoming = is_move & (work_base["_target_store"] == current_store)
 
+    # ТИК-заказы: склад = "ТИК", галочка Перемещение ещё НЕ стоит,
+    # целевой магазин — текущий. Показываем в «Новых», ждут подтверждения отправки.
+    is_tik_pending = (
+        (work_base[C_WH].str.strip() == STORE_TIK)
+        & ~is_move
+        & (work_base["_target_store"] == current_store)
+    )
+
     confirmed_set = {str(x) for x in st.session_state.confirmed_cancels}
 
     is_cancelled_unconfirmed = (
         work_base["_is_cancelled"]
-        & (is_f_match | is_pz_match | is_incoming)
+        & (is_f_match | is_pz_match | is_incoming | is_tik_pending)
         & ~work_base[C_ORDER].astype(str).isin(confirmed_set)
     )
 
-    base_mask = ((is_f_match | is_pz_match) & ~is_move) | is_incoming
+    base_mask = ((is_f_match | is_pz_match) & ~is_move) | is_incoming | is_tik_pending
 
     # Определяем непросмотренные изменения векторно
     reviewed     = st.session_state.reviewed_changes
@@ -472,6 +485,8 @@ def render_store(current_store: str) -> None:
         (base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev) & not_confirmed_cancelled)
         | is_cancelled_unconfirmed
     ].copy()
+    # Передаём флаг ТИК в display_df для использования в _render_order
+    display_df["_is_tik_pending"] = is_tik_pending.reindex(display_df.index, fill_value=False)
 
     in_work_ids = st.session_state.local_in_work
 
@@ -485,16 +500,20 @@ def render_store(current_store: str) -> None:
         has_edit       = bool(edit_text.strip()) and rk not in reviewed
         is_move_needed = target != current_store and target != "Общий" and not incoming
         cancelled      = group["_is_cancelled"].iloc[0]
+        tik_pending    = group["_is_tik_pending"].iloc[0]
 
         tag_str = _build_tags(
             comment_str, is_move_needed, has_edit,
             is_pz_item, incoming, cancelled, in_work_section,
+            is_tik_pending=tik_pending,
         )
         label = f"Заказ №{oid}{f'  [{tag_str}]' if tag_str else ''}"
 
         with st.expander(label):
             if cancelled:
                 st.error("🚫 Этот заказ отменён")
+            if tik_pending:
+                st.info(f"🏭 Товар на складе ТИК — требуется отправка перемещения в {current_store}")
             if has_edit:
                 prefix = "Правка" if in_work_section else "Изменение"
                 st.error(f"{prefix}: {edit_text}")
@@ -519,6 +538,35 @@ def render_store(current_store: str) -> None:
                     st.session_state.reviewed_changes.add(rk)
                     save_state_to_sheets()
                     st.rerun()
+
+            elif tik_pending:
+                # ТИК-заказ: две независимые кнопки
+                # 1. Подтвердить перемещение — ставит TRUE в графу Перемещение,
+                #    заказ остаётся в «Новых» (теперь будет виден как is_incoming)
+                if st.button(
+                    "🚛 Подтвердить перемещение с ТИК", key=f"tik_mv_{oid}",
+                    type="primary", use_container_width=True,
+                ):
+                    update_sheet_cells(group, C, {"MOVE": TRUE_VAL})
+                    st.rerun()
+
+                st.markdown("---")
+                # 2. Взять в работу — стандартное поведение магазина
+                if not in_work_section:
+                    if st.button("В работу", key=f"w_{oid}", use_container_width=True):
+                        st.session_state.local_in_work.add(oid)
+                        save_state_to_sheets()
+                        st.rerun()
+                else:
+                    if st.button(
+                        "✅ ПРИНЯТО И СОБРАНО", key=f"dn_{oid}",
+                        type="primary", use_container_width=True,
+                    ):
+                        update_sheet_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
+                        st.session_state.local_in_work.discard(oid)
+                        _log_action(oid, group, current_store, "done")
+                        save_state_to_sheets()
+                        st.rerun()
 
             elif in_work_section:
                 if is_move_needed:
