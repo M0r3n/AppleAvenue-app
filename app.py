@@ -173,6 +173,9 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
 
 def identify_target_store(comment: str) -> str:
     c = str(comment).lower()
+    # Если в комменте есть "d" — это доставка, относится к Горбушке
+    if "d" in c:
+        return "Горбушка"
     if any(k in c for k in ["пек", "пкн", "pekin"]): return "Пекин"
     if any(k in c for k in ["горб", "грб", "gorb"]): return "Горбушка"
     return "Общий"
@@ -247,6 +250,7 @@ def render_store(current_store: str) -> None:
         st.subheader("🆕 Новые / Изменения")
         new_items = display_df[~display_df[C_ORDER].isin(st.session_state.local_in_work)]
         for oid, group in new_items.groupby(C_ORDER, sort=False):
+            comment_str = str(group[C_COMMENT].iloc[0]).lower()
             target = group["_target_store"].iloc[0]
             incoming = group[C_MOVE].iloc[0] == TRUE_VAL
             is_pz_item = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
@@ -256,6 +260,7 @@ def render_store(current_store: str) -> None:
             is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
             tags = []
+            if "d" in comment_str: tags.append("📦 ДОСТАВКА")
             if is_move_needed: tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
             if has_edit: tags.append("⚠️ ИЗМЕНЕНИЕ")
             if is_pz_item: tags.append("⏳ ПЗ")
@@ -281,6 +286,7 @@ def render_store(current_store: str) -> None:
         st.subheader("🛠 В сборке")
         in_work = display_df[display_df[C_ORDER].isin(st.session_state.local_in_work)]
         for oid, group in in_work.groupby(C_ORDER, sort=False):
+            comment_str = str(group[C_COMMENT].iloc[0]).lower()
             target = group["_target_store"].iloc[0]
             incoming = group[C_MOVE].iloc[0] == TRUE_VAL
             is_pz_item = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
@@ -288,6 +294,7 @@ def render_store(current_store: str) -> None:
             is_move_needed = (target != current_store and target != "Общий" and not incoming)
             
             tags = []
+            if "d" in comment_str: tags.append("📦 ДОСТАВКА")
             if is_move_needed: tags.append("🚚 ПЕРЕМЕЩЕНИЕ")
             if has_edit: tags.append("⚠️ ПРАВКА")
             if is_pz_item: tags.append("⏳ ПЗ")
