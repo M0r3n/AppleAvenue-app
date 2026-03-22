@@ -408,9 +408,15 @@ def render_store(current_store: str) -> None:
         index=work_base.index,
     )
 
+    # ── ИСПРАВЛЕНИЕ: явно исключаем подтверждённые отменённые заказы из base_mask ──
+    not_confirmed_cancelled = ~(
+        work_base["_is_cancelled"]
+        & work_base[C_ORDER].astype(str).isin(_confirmed)
+    )
+
     # Основной пул: незавершённые + непросмотренные изменения + отменённые этого магазина
     display_df = work_base[
-        (base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev))
+        (base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev) & not_confirmed_cancelled)
         | is_cancelled_store
     ].copy()
 
@@ -453,6 +459,7 @@ def render_store(current_store: str) -> None:
                     st.session_state.confirmed_cancels.add(str(oid))
                     st.session_state.local_in_work.discard(oid)
                     save_persistent_state()
+                    load_data_integrated.clear()  # ── явная очистка кеша перед rerun
                     st.rerun()
             elif has_edit:
                 btn_label = "Учесть правку" if in_work_section else "Учесть Изменение"
