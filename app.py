@@ -33,25 +33,19 @@ cookie_manager = stx.CookieManager(key="avenue_auth_manager_v3")
 def check_password() -> bool:
     if st.session_state.get("password_correct"):
         return True
-
     all_cookies = cookie_manager.get_all()
     if all_cookies is None:
         time.sleep(0.8)
         all_cookies = cookie_manager.get_all()
-
     if all_cookies and str(all_cookies.get(COOKIE_NAME)) == COOKIE_VALUE:
         st.session_state.password_correct = True
         return True
-
     st.title("🔐 Вход в систему")
-
     if "password" not in st.secrets:
         st.error("Критическая ошибка: Пароль не настроен в Secrets.")
         st.stop()
-
     pwd = st.text_input("Введите код доступа:", type="password", key="login_input")
     remember = st.checkbox("Запомнить меня на этом устройстве", value=True)
-
     if st.button("Войти", key="login_btn", type="primary"):
         if pwd == st.secrets["password"]:
             st.session_state.password_correct = True
@@ -145,50 +139,24 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
     raw_data = sheet.get_all_values()
     if not raw_data:
         return pd.DataFrame(), {}
-
     header_idx = next(
-        (
-            i for i, row in enumerate(raw_data[:100])
-            if "Наименование" in row
-            and "Склад" in row
-            and not any("ячейку" in str(c) for c in row)
-        ),
+        (i for i, row in enumerate(raw_data[:100]) if "Наименование" in row and "Склад" in row),
         -1,
     )
-    if header_idx == -1:
-        return pd.DataFrame(), {}
-
+    if header_idx == -1: return pd.DataFrame(), {}
     headers = [str(h).strip().replace("\n", " ") for h in raw_data[header_idx]]
-
     def col_idx(name: str) -> int:
-        try:
-            return headers.index(name)
-        except ValueError:
-            raise ValueError(f"Колонка '{name}' не найдена в таблице")
-
-    try:
-        col_map = {
-            "ORDER":   col_idx("Наименование") - 1,
-            "PRODUCT": col_idx("Наименование"),
-            "QTY":     col_idx("Кол-во"),
-            "WH":      col_idx("Склад"),
-            "COMMENT": col_idx("Комментарий"),
-            "EDIT":    col_idx("Изменения заказа"),
-            "INWORK":  col_idx("Под ЗАКАЗ"),
-            "MOVE":    col_idx("Перемещение"),
-            "DONE":    col_idx("Собрано"),
-            "STATUS":  col_idx("Статус") if "Статус" in headers else len(headers) - 1,
-        }
-    except ValueError as e:
-        st.error(str(e))
-        return pd.DataFrame(), {}
-
+        return headers.index(name)
+    col_map = {
+        "ORDER": col_idx("Наименование") - 1, "PRODUCT": col_idx("Наименование"),
+        "QTY": col_idx("Кол-во"), "WH": col_idx("Склад"), "COMMENT": col_idx("Комментарий"),
+        "EDIT": col_idx("Изменения заказа"), "INWORK": col_idx("Под ЗАКАЗ"),
+        "MOVE": col_idx("Перемещение"), "DONE": col_idx("Собрано"),
+        "STATUS": col_idx("Статус") if "Статус" in headers else len(headers) - 1,
+    }
     df = pd.DataFrame(raw_data[START_ROW - 1:], columns=headers)
     df["_sheet_row"] = range(START_ROW, START_ROW + len(df))
-
-    product_col = headers[col_map["PRODUCT"]]
-    df = df[df[product_col].str.strip().astype(bool)].copy()
-
+    df = df[df[headers[col_map["PRODUCT"]]].str.strip().astype(bool)].copy()
     st.session_state.last_sync = datetime.now().strftime("%H:%M:%S")
     return df, col_map
 
@@ -196,8 +164,7 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
     sheet = get_worksheet()
     cell_list = [
         gspread.Cell(row=int(row_num), col=col_map[key] + 1, value=val)
-        for key, val in updates.items()
-        for row_num in group["_sheet_row"]
+        for key, val in updates.items() for row_num in group["_sheet_row"]
     ]
     sheet.update_cells(cell_list, value_input_option="USER_ENTERED")
     load_data_integrated.clear()
@@ -206,10 +173,8 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
 
 def identify_target_store(comment: str) -> str:
     c = str(comment).lower()
-    if any(k in c for k in ["пек", "пкн", "pekin"]):
-        return "Пекин"
-    if any(k in c for k in ["горб", "грб", "gorb"]):
-        return "Горбушка"
+    if any(k in c for k in ["пек", "пкн", "pekin"]): return "Пекин"
+    if any(k in c for k in ["горб", "грб", "gorb"]): return "Горбушка"
     return "Общий"
 
 def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
@@ -222,49 +187,26 @@ if df_mem.empty or not C:
     st.stop()
 
 cols = df_mem.columns
-C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT = (
-    cols[C["ORDER"]], cols[C["PRODUCT"]], cols[C["QTY"]],
-    cols[C["WH"]], cols[C["COMMENT"]],
-)
-C_DONE, C_MOVE, C_STATUS, C_EDIT, C_INWORK = (
-    cols[C["DONE"]], cols[C["MOVE"]], cols[C["STATUS"]],
-    cols[C["EDIT"]], cols[C["INWORK"]],
-)
+C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT = cols[C["ORDER"]], cols[C["PRODUCT"]], cols[C["QTY"]], cols[C["WH"]], cols[C["COMMENT"]]
+C_DONE, C_MOVE, C_STATUS, C_EDIT, C_INWORK = cols[C["DONE"]], cols[C["MOVE"]], cols[C["STATUS"]], cols[C["EDIT"]], cols[C["INWORK"]]
 
-TABLE_COLS = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT]
-COL_RENAME = {
-    C_ORDER: "Заказ", C_PRODUCT: "Товар", C_QTY: "Кол",
-    C_WH: "Склад", C_COMMENT: "Коммент",
-}
+TABLE_COLS, COL_RENAME = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT], {C_ORDER: "Заказ", C_PRODUCT: "Товар", C_QTY: "Кол", C_WH: "Склад", C_COMMENT: "Коммент"}
 
 current_order_ids = set(df_mem[C_ORDER].unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
-    if new_ids:
-        st.session_state.new_orders_alert = new_ids
+    if new_ids: st.session_state.new_orders_alert = new_ids
 st.session_state.prev_order_ids = current_order_ids
 
-is_canceled = df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)
-canceled_df = df_mem[is_canceled].copy()
-work_base   = df_mem[~is_canceled].copy()
+work_base = df_mem[~df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)].copy()
 work_base["_target_store"] = work_base[C_COMMENT].apply(identify_target_store)
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
-MENU_ITEMS = [
-    "🏪 Магазин: ГОРБУШКА",
-    "🏪 Магазин: ПЕКИН",
-    "🚚 Перемещения (Активные)",
-    "⏳ Товар Под заказ",
-    "✅ Выполненные сборки",
-    "🚫 Отмененные заказы",
-]
-
 st.sidebar.title("🏢 Меню Авеню")
-menu = st.sidebar.selectbox("Выберите раздел:", MENU_ITEMS)
+menu = st.sidebar.selectbox("Выберите раздел:", ["🏪 Магазин: ГОРБУШКА", "🏪 Магазин: ПЕКИН", "🚚 Перемещения (Активные)", "⏳ Товар Под заказ", "✅ Выполненные сборки", "🚫 Отмененные заказы"])
 
-if st.sidebar.button("🚪 Выйти (сбросить вход)"):
+if st.sidebar.button("🚪 Выйти"):
     cookie_manager.delete(COOKIE_NAME)
-    time.sleep(0.5)
     st.session_state.password_correct = False
     st.rerun()
 
@@ -277,153 +219,90 @@ if st.sidebar.button("🔃 Обновить вручную"):
 
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
-
-    store_new_alert = {
-        oid for oid in st.session_state.new_orders_alert
-        if oid in work_base[C_ORDER].values
-    }
-    if store_new_alert:
-        st.success(f"🆕 Новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
-
-    # Логика определения "своего" склада: Сток и Горбушка — это одно и то же
+    
+    # Фильтр "своего" склада: Сток и Горбушка — в одну кучу
     if current_store == "Горбушка":
         wh_match = work_base[C_WH].str.contains("Горб|Сток", case=False, na=False)
     else:
         wh_match = work_base[C_WH].str.contains("Пекин", case=False, na=False)
 
-    is_pz_row   = work_base[C_WH].isin(PZ_LIST)
-    is_f_match  = wh_match & ~is_pz_row
-    is_pz_match = (
-        (work_base[C_WH] == f"ПЗ {current_store}")
-        & (work_base[C_INWORK] == TRUE_VAL)
-    )
-    is_move     = work_base[C_MOVE] == TRUE_VAL
+    is_pz_row = work_base[C_WH].isin(PZ_LIST)
+    is_f_match = wh_match & ~is_pz_row
+    is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & (work_base[C_INWORK] == TRUE_VAL)
+    is_move = work_base[C_MOVE] == TRUE_VAL
     is_incoming = is_move & (work_base["_target_store"] == current_store)
 
-    display_df = work_base[
-        ((is_f_match | is_pz_match) & ~is_move) | is_incoming
-    ].copy()
-
-    has_unreviewed_edit = (
-        (display_df[C_EDIT] != "")
-        & (~display_df[C_ORDER].isin(st.session_state.reviewed_changes))
-    )
-    display_df = display_df[
-        (display_df[C_DONE] != TRUE_VAL) | has_unreviewed_edit
-    ]
+    display_df = work_base[((is_f_match | is_pz_match) & ~is_move) | is_incoming].copy()
+    display_df = display_df[(display_df[C_DONE] != TRUE_VAL) | ((display_df[C_EDIT] != "") & (~display_df[C_ORDER].isin(st.session_state.reviewed_changes)))]
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("🆕 Новые / Изменения")
         new_items = display_df[~display_df[C_ORDER].isin(st.session_state.local_in_work)]
-        if new_items.empty:
-            st.info("Нет новых заказов")
-        else:
-            for oid, group in new_items.groupby(C_ORDER, sort=False):
-                incoming    = group[C_MOVE].iloc[0] == TRUE_VAL
-                is_pz_item  = (
-                    group[C_WH].isin(PZ_LIST).any()
-                    and (group[C_INWORK] == TRUE_VAL).any()
-                )
-                has_edit = (
-                    (group[C_EDIT] != "").any()
-                    and oid not in st.session_state.reviewed_changes
-                )
-                tag = (
-                    (" ⚠️ Изменение" if has_edit else "")
-                    + (" ⏳ ПЗ" if is_pz_item else "")
-                    + (" 🚚 ЕДЕТ" if incoming else "")
-                )
-                with st.expander(f"Заказ №{oid}{tag}"):
-                    if has_edit:
-                        st.error(f"Изменение: {group[C_EDIT].iloc[0]}")
-                    render_order_table(group, TABLE_COLS, COL_RENAME)
-                    if has_edit:
-                        if st.button("Учесть Изменение", key=f"rev_n_{oid}"):
-                            st.session_state.reviewed_changes.add(oid)
-                            save_persistent_state()
-                            st.rerun()
-                    else:
-                        if st.button("В работу", key=f"w_{oid}"):
-                            st.session_state.local_in_work.add(oid)
-                            save_persistent_state()
-                            st.rerun()
+        for oid, group in new_items.groupby(C_ORDER, sort=False):
+            target = group["_target_store"].iloc[0]
+            # ЯРКАЯ ПЛАШКА ПЕРЕМЕЩЕНИЯ
+            is_move_needed = (target != current_store and target != "Общий" and group[C_MOVE].iloc[0] != TRUE_VAL)
+            has_edit = (group[C_EDIT] != "").any() and oid not in st.session_state.reviewed_changes
+            
+            tag = ""
+            if is_move_needed: tag += " 🚚 ПЕРЕМЕЩЕНИЕ"
+            if has_edit: tag += " ⚠️ ПРАВКА"
+            
+            with st.expander(f"Заказ №{oid}{tag}"):
+                if has_edit: st.error(f"Изменение: {group[C_EDIT].iloc[0]}")
+                render_order_table(group, TABLE_COLS, COL_RENAME)
+                if st.button("В работу", key=f"w_{oid}"):
+                    st.session_state.local_in_work.add(oid)
+                    save_persistent_state()
+                    st.rerun()
 
     with col2:
         st.subheader("🛠 В сборке")
         in_work = display_df[display_df[C_ORDER].isin(st.session_state.local_in_work)]
-        if in_work.empty:
-            st.info("Пока ничего не взято")
-        else:
-            for oid, group in in_work.groupby(C_ORDER, sort=False):
-                target   = group["_target_store"].iloc[0]
-                incoming = group[C_MOVE].iloc[0] == TRUE_VAL
-                has_edit = (
-                    (group[C_EDIT] != "").any()
-                    and oid not in st.session_state.reviewed_changes
-                )
-                with st.expander(f"Заказ №{oid}{' ⚠️ ПРАВКА' if has_edit else ''}"):
-                    if has_edit:
-                        st.error(f"Правка: {group[C_EDIT].iloc[0]}")
-                    render_order_table(group, TABLE_COLS, COL_RENAME)
-                    
-                    if has_edit:
-                        if st.button("Учесть правку", key=f"rev_w_{oid}"):
-                            st.session_state.reviewed_changes.add(oid)
-                            save_persistent_state()
-                            st.rerun()
-                    # Если склад Сток/Горб, а цель Пекин (и это еще не в пути) — показываем кнопку перемещения
-                    elif target != current_store and target != "Общий" and not incoming:
-                        if st.button("🚛 Отправить перемещение", key=f"mv_{oid}"):
-                            update_google_cells(group, C, {"MOVE": TRUE_VAL})
-                            st.session_state.local_in_work.discard(oid)
-                            save_persistent_state()
-                            st.rerun()
-                    else:
-                        label = "✅ Принято и собрано" if incoming else "✅ Завершить сборку"
-                        if st.button(label, key=f"dn_{oid}", type="primary"):
-                            update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
-                            st.session_state.local_in_work.discard(oid)
-                            st.session_state.reviewed_changes.discard(oid)
-                            save_persistent_state()
-                            st.rerun()
+        for oid, group in in_work.groupby(C_ORDER, sort=False):
+            target = group["_target_store"].iloc[0]
+            incoming = group[C_MOVE].iloc[0] == TRUE_VAL
+            is_move_needed = (target != current_store and target != "Общий" and not incoming)
+            
+            tag = " 🚚 ПЕРЕМЕЩЕНИЕ" if is_move_needed else ""
+            with st.expander(f"Заказ №{oid}{tag}"):
+                render_order_table(group, TABLE_COLS, COL_RENAME)
+                if is_move_needed:
+                    if st.button("🚛 ОТПРАВИТЬ ПЕРЕМЕЩЕНИЕ", key=f"mv_{oid}", type="primary", use_container_width=True):
+                        update_google_cells(group, C, {"MOVE": TRUE_VAL})
+                        st.session_state.local_in_work.discard(oid)
+                        save_persistent_state()
+                        st.rerun()
+                else:
+                    label = "✅ ПРИНЯТО И СОБРАНО" if incoming else "✅ ЗАВЕРШИТЬ СБОРКУ"
+                    if st.button(label, key=f"dn_{oid}", type="primary", use_container_width=True):
+                        update_google_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
+                        st.session_state.local_in_work.discard(oid)
+                        save_persistent_state()
+                        st.rerun()
 
 # ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
 if "Магазин" in menu:
     render_store("Горбушка" if "ГОРБУШКА" in menu else "Пекин")
-
 elif menu == "🚚 Перемещения (Активные)":
     st.title("🚚 В пути")
     moves = work_base[work_base[C_MOVE] == TRUE_VAL]
-    if moves.empty:
-        st.info("Активных перемещений нет")
-    else:
-        for oid, group in moves.groupby(C_ORDER, sort=False):
-            with st.expander(f"Перемещение №{oid}"):
-                render_order_table(group, TABLE_COLS, COL_RENAME)
-                if st.button("Удалить из списка", key=f"cl_mv_{oid}"):
-                    update_google_cells(group, C, {"MOVE": FALSE_VAL})
-                    st.rerun()
-
+    for oid, group in moves.groupby(C_ORDER, sort=False):
+        with st.expander(f"Перемещение №{oid}"):
+            render_order_table(group, TABLE_COLS, COL_RENAME)
+            if st.button("Удалить из списка", key=f"cl_mv_{oid}"):
+                update_google_cells(group, C, {"MOVE": FALSE_VAL})
+                st.rerun()
 elif menu == "⏳ Товар Под заказ":
     st.title("⏳ Ожидание ПЗ")
-    pz = work_base[
-        work_base[C_WH].isin(PZ_LIST)
-        & (work_base[C_INWORK] != TRUE_VAL)
-        & (work_base[C_DONE] != TRUE_VAL)
-    ]
+    pz = work_base[work_base[C_WH].isin(PZ_LIST) & (work_base[C_INWORK] != TRUE_VAL) & (work_base[C_DONE] != TRUE_VAL)]
     st.dataframe(pz[TABLE_COLS].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
-
 elif menu == "✅ Выполненные сборки":
     st.title("✅ Последние собранные")
     done = work_base[work_base[C_DONE] == TRUE_VAL].iloc[::-1].head(PREVIEW_ORDERS)
     st.dataframe(done[TABLE_COLS].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
-
 elif menu == "🚫 Отмененные заказы":
     st.title("🚫 Отмененные")
-    st.dataframe(
-        canceled_df[TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(df_mem[df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)][TABLE_COLS + [C_STATUS]].rename(columns=COL_RENAME), use_container_width=True, hide_index=True)
