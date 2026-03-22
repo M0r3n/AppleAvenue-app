@@ -30,12 +30,10 @@ st.set_page_config(page_title="Авеню: Система Заказов", layou
 # ── АВТОРИЗАЦИЯ ──────────────────────────────────────────────────────────────
 cookie_manager = stx.CookieManager(key="avenue_auth_manager_v3")
 
-
 def check_password() -> bool:
     if st.session_state.get("password_correct"):
         return True
 
-    # Ждём инициализации JS-куки только при первом обращении
     all_cookies = cookie_manager.get_all()
     if all_cookies is None:
         time.sleep(0.8)
@@ -69,9 +67,7 @@ def check_password() -> bool:
             st.rerun()
         else:
             st.error("❌ Неверный код")
-
     return False
-
 
 if not check_password():
     st.stop()
@@ -91,7 +87,6 @@ def load_persistent_state() -> tuple[set, set]:
             pass
     return set(), set()
 
-
 def save_persistent_state() -> None:
     try:
         with open(DB_FILE, "w") as f:
@@ -104,7 +99,6 @@ def save_persistent_state() -> None:
             )
     except OSError as e:
         st.warning(f"Не удалось сохранить состояние: {e}")
-
 
 # ── ИНИЦИАЛИЗАЦИЯ SESSION STATE ───────────────────────────────────────────────
 st_autorefresh(interval=REFRESH_MS, key="data_refresh")
@@ -137,7 +131,6 @@ def get_client() -> gspread.Client:
         st.error(f"Ошибка авторизации Google: {e}")
         st.stop()
 
-
 def get_worksheet() -> gspread.Worksheet:
     client = get_client()
     spreadsheet = client.open_by_key(SHEET_ID)
@@ -146,7 +139,6 @@ def get_worksheet() -> gspread.Worksheet:
     except gspread.WorksheetNotFound:
         return spreadsheet.get_worksheet(0)
 
-
 @st.cache_data(ttl=600)
 def load_data_integrated() -> tuple[pd.DataFrame, dict]:
     sheet    = get_worksheet()
@@ -154,7 +146,6 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
     if not raw_data:
         return pd.DataFrame(), {}
 
-    # Ищем строку-заголовок
     header_idx = next(
         (
             i for i, row in enumerate(raw_data[:100])
@@ -195,13 +186,11 @@ def load_data_integrated() -> tuple[pd.DataFrame, dict]:
     df = pd.DataFrame(raw_data[START_ROW - 1:], columns=headers)
     df["_sheet_row"] = range(START_ROW, START_ROW + len(df))
 
-    # Убираем пустые строки по колонке «Наименование» за один проход
     product_col = headers[col_map["PRODUCT"]]
     df = df[df[product_col].str.strip().astype(bool)].copy()
 
     st.session_state.last_sync = datetime.now().strftime("%H:%M:%S")
     return df, col_map
-
 
 def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> None:
     sheet = get_worksheet()
@@ -215,19 +204,13 @@ def update_google_cells(group: pd.DataFrame, col_map: dict, updates: dict) -> No
 
 # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
 
-_STORE_KEYWORDS: dict[str, tuple[tuple[str, ...], str]] = {
-    "Пекин":    (("пек", "пкн", "pekin"), "Пекин"),
-    "Горбушка": (("горб", "грб", "gorb"), "Горбушка"),
-}
-
-
 def identify_target_store(comment: str) -> str:
     c = str(comment).lower()
-    for store, (kws, label) in _STORE_KEYWORDS.items():
-        if any(k in c for k in kws):
-            return label
+    if any(k in c for k in ["пек", "пкн", "pekin"]):
+        return "Пекин"
+    if any(k in c for k in ["горб", "грб", "gorb"]):
+        return "Горбушка"
     return "Общий"
-
 
 def render_order_table(group: pd.DataFrame, table_cols: list, col_rename: dict) -> None:
     st.table(group[table_cols].rename(columns=col_rename))
@@ -254,7 +237,6 @@ COL_RENAME = {
     C_WH: "Склад", C_COMMENT: "Коммент",
 }
 
-# Оповещения о новых заказах
 current_order_ids = set(df_mem[C_ORDER].unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
@@ -262,7 +244,6 @@ if st.session_state.prev_order_ids:
         st.session_state.new_orders_alert = new_ids
 st.session_state.prev_order_ids = current_order_ids
 
-# Разделяем отменённые / рабочие — один раз на весь рендер
 is_canceled = df_mem[C_STATUS].str.lower().str.contains("отмен", na=False)
 canceled_df = df_mem[is_canceled].copy()
 work_base   = df_mem[~is_canceled].copy()
@@ -304,12 +285,14 @@ def render_store(current_store: str) -> None:
     if store_new_alert:
         st.success(f"🆕 Новые заказы: {', '.join(str(o) for o in sorted(store_new_alert))}")
 
-    wh_keywords = ["Горб", "Сток"] if current_store == "Горбушка" else ["Пекин"]
+    # Логика определения "своего" склада: Сток и Горбушка — это одно и то же
+    if current_store == "Горбушка":
+        wh_match = work_base[C_WH].str.contains("Горб|Сток", case=False, na=False)
+    else:
+        wh_match = work_base[C_WH].str.contains("Пекин", case=False, na=False)
+
     is_pz_row   = work_base[C_WH].isin(PZ_LIST)
-    is_f_match  = (
-        work_base[C_WH].str.contains("|".join(wh_keywords), case=False, na=False)
-        & ~is_pz_row
-    )
+    is_f_match  = wh_match & ~is_pz_row
     is_pz_match = (
         (work_base[C_WH] == f"ПЗ {current_store}")
         & (work_base[C_INWORK] == TRUE_VAL)
@@ -321,7 +304,6 @@ def render_store(current_store: str) -> None:
         ((is_f_match | is_pz_match) & ~is_move) | is_incoming
     ].copy()
 
-    # Скрываем уже собранные без правок / просмотренных правок
     has_unreviewed_edit = (
         (display_df[C_EDIT] != "")
         & (~display_df[C_ORDER].isin(st.session_state.reviewed_changes))
@@ -385,11 +367,13 @@ def render_store(current_store: str) -> None:
                     if has_edit:
                         st.error(f"Правка: {group[C_EDIT].iloc[0]}")
                     render_order_table(group, TABLE_COLS, COL_RENAME)
+                    
                     if has_edit:
                         if st.button("Учесть правку", key=f"rev_w_{oid}"):
                             st.session_state.reviewed_changes.add(oid)
                             save_persistent_state()
                             st.rerun()
+                    # Если склад Сток/Горб, а цель Пекин (и это еще не в пути) — показываем кнопку перемещения
                     elif target != current_store and target != "Общий" and not incoming:
                         if st.button("🚛 Отправить перемещение", key=f"mv_{oid}"):
                             update_google_cells(group, C, {"MOVE": TRUE_VAL})
