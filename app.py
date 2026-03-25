@@ -350,17 +350,32 @@ if df_mem.empty or not C:
     st.error("Не удалось загрузить данные. Проверьте таблицу и настройки.")
     st.stop()
 
-cols      = df_mem.columns
-C_ORDER   = cols[C["ORDER"]]
-C_PRODUCT = cols[C["PRODUCT"]]
-C_QTY     = cols[C["QTY"]]
-C_WH      = cols[C["WH"]]
-C_COMMENT = cols[C["COMMENT"]]
-C_DONE    = cols[C["DONE"]]
-C_MOVE    = cols[C["MOVE"]]
-C_STATUS  = cols[C["STATUS"]]
-C_EDIT    = cols[C["EDIT"]]
-C_INWORK  = cols[C["INWORK"]]
+# ВАЖНО:
+# создаём служебные уникальные колонки, чтобы не зависеть от дублирующихся
+# названий столбцов в Google Sheets.
+df_mem = df_mem.copy()
+
+C_ORDER   = "__order__"
+C_PRODUCT = "__product__"
+C_QTY     = "__qty__"
+C_WH      = "__wh__"
+C_COMMENT = "__comment__"
+C_DONE    = "__done__"
+C_MOVE    = "__move__"
+C_STATUS  = "__status__"
+C_EDIT    = "__edit__"
+C_INWORK  = "__inwork__"
+
+df_mem[C_ORDER]   = df_mem.iloc[:, C["ORDER"]]
+df_mem[C_PRODUCT] = df_mem.iloc[:, C["PRODUCT"]]
+df_mem[C_QTY]     = df_mem.iloc[:, C["QTY"]]
+df_mem[C_WH]      = df_mem.iloc[:, C["WH"]]
+df_mem[C_COMMENT] = df_mem.iloc[:, C["COMMENT"]]
+df_mem[C_DONE]    = df_mem.iloc[:, C["DONE"]]
+df_mem[C_MOVE]    = df_mem.iloc[:, C["MOVE"]]
+df_mem[C_STATUS]  = df_mem.iloc[:, C["STATUS"]]
+df_mem[C_EDIT]    = df_mem.iloc[:, C["EDIT"]]
+df_mem[C_INWORK]  = df_mem.iloc[:, C["INWORK"]]
 
 TABLE_COLS = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT]
 COL_RENAME = {
