@@ -9,6 +9,16 @@ v4.5 — безопасный рефакторинг без изменения U
 - обновления в Google Sheets по-прежнему точечные;
 - время записи по МСК сохраняется строкой без авто-конвертации Sheets;
 - сохранён текущий UI, сценарии и бизнес-логика.
+
+Изменения в разделе "Отчёт":
+- улучшено отображение таблицы;
+- добавлен выбор периода отчёта;
+- добавлен произвольный диапазон дат;
+- добавлен поиск по позиции;
+- позиции сортируются по количеству продаж (по убыванию);
+- добавлено сохранение отчёта в archive-блок листа avenue_state;
+- добавана возможность скачать как текущий, так и сохранённый отчёт в Excel;
+- отчёты хранятся бессрочно в Google Sheets.
 """
 
 from __future__ import annotations
@@ -16,6 +26,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -71,6 +82,28 @@ MENU_OPTIONS = [
 ]
 
 STATE_HEADERS = ["local_in_work", "reviewed_changes", "confirmed_cancels", "completed_log"]
+
+REPORT_LOG_HEADERS = [
+    "report_id",
+    "created_at",
+    "period_name",
+    "date_from",
+    "date_to",
+    "search",
+    "total_items",
+    "total_sold",
+]
+
+REPORT_ITEM_HEADERS = [
+    "report_id",
+    "sort_order",
+    "product",
+    "sold",
+    "row_type",
+]
+
+REPORT_EXPORT_SHEET = "Отчёт"
+REPORT_META_SHEET = "Параметры"
 
 
 # ── НАСТРОЙКА СТРАНИЦЫ ────────────────────────────────────────────────────────
@@ -304,15 +337,31 @@ def get_orders_worksheet() -> gspread.Worksheet:
         return ss.get_worksheet(0)
 
 
+def _init_state_sheet_layout(ws: gspread.Worksheet) -> None:
+    ws.update("A1:D1", [STATE_HEADERS], value_input_option="RAW")
+    ws.update("G1:N1", [REPORT_LOG_HEADERS], value_input_option="RAW")
+    ws.update("P1:T1", [REPORT_ITEM_HEADERS], value_input_option="RAW")
+
+
 @st.cache_resource
 def get_state_worksheet() -> gspread.Worksheet:
     ss = get_spreadsheet()
     try:
-        return ss.worksheet(STATE_TAB_NAME)
+        ws = ss.worksheet(STATE_TAB_NAME)
     except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=STATE_TAB_NAME, rows=5000, cols=4)
-        ws.update([STATE_HEADERS], value_input_option="RAW")
+        ws = ss.add_worksheet(title=STATE_TAB_NAME, rows=10000, cols=20)
+        _init_state_sheet_layout(ws)
         return ws
+
+    try:
+        values = ws.get("A1:T3")
+        flat = " ".join(" ".join(row) for row in values if row)
+        if "report_id" not in flat:
+            _init_state_sheet_layout(ws)
+    except Exception:
+        pass
+
+    return ws
 
 
 # ── STATE В SHEETS ────────────────────────────────────────────────────────────
@@ -328,7 +377,7 @@ def _empty_state() -> dict[str, Any]:
 @st.cache_data(ttl=STATE_SYNC_TTL)
 def load_state_from_sheets() -> dict[str, Any]:
     try:
-        rows = get_state_worksheet().get_all_values()
+        rows = get_state_worksheet().get("A1:D")
         if len(rows) < 2:
             return _empty_state()
 
@@ -627,53 +676,399 @@ def _build_period_report(report_df: pd.DataFrame, start_dt: pd.Timestamp, end_dt
     return result
 
 
+def _format_period_caption(start_dt: pd.Timestamp, end_dt_exclusive: pd.Timestamp) -> str:
+    end_inclusive = end_dt_exclusive - pd.Timedelta(days=1)
+    return f"{start_dt.strftime('%d.%m.%Y')} — {end_inclusive.strftime('%d.%m.%Y')}"
+
+
+def _get_report_period_bounds(
+    period_mode: str,
+    custom_start: Any | None = None,
+    custom_end: Any | None = None,
+) -> tuple[pd.Timestamp, pd.Timestamp, str]:
+    now_ts = pd.Timestamp(_now().replace(tzinfo=None))
+    today_start = now_ts.normalize()
+    tomorrow_start = today_start + pd.Timedelta(days=1)
+
+    if period_mode == "За сегодня":
+        return today_start, tomorrow_start, "За сегодня"
+
+    if period_mode == "За неделю":
+        week_start = today_start - pd.Timedelta(days=today_start.weekday())
+        next_week_start = week_start + pd.Timedelta(days=7)
+        return week_start, next_week_start, "За неделю"
+
+    if period_mode == "За месяц":
+        month_start = today_start.replace(day=1)
+        next_month_start = month_start + pd.offsets.MonthBegin(1)
+        return month_start, next_month_start, "За месяц"
+
+    start_dt = pd.Timestamp(custom_start).normalize()
+    end_dt = pd.Timestamp(custom_end).normalize() + pd.Timedelta(days=1)
+
+    if end_dt <= start_dt:
+        end_dt = start_dt + pd.Timedelta(days=1)
+
+    return start_dt, end_dt, "Произвольный период"
+
+
+def _apply_report_search(report_df: pd.DataFrame, search_text: str) -> pd.DataFrame:
+    query = _safe_str(search_text).strip()
+    if not query:
+        return report_df
+
+    return report_df[
+        report_df["Товар"].fillna("").astype(str).str.contains(query, case=False, na=False)
+    ].copy()
+
+
+def _build_report_filename(period_name: str, start_dt: pd.Timestamp, end_dt_exclusive: pd.Timestamp) -> str:
+    period_slug = {
+        "За сегодня": "today",
+        "За неделю": "week",
+        "За месяц": "month",
+        "Произвольный период": "custom",
+    }.get(period_name, "report")
+
+    end_inclusive = end_dt_exclusive - pd.Timedelta(days=1)
+    ts = _now().strftime("%Y%m%d_%H%M%S")
+
+    return (
+        f"avenue_report_{period_slug}_"
+        f"{start_dt.strftime('%Y%m%d')}_{end_inclusive.strftime('%Y%m%d')}_{ts}.xlsx"
+    )
+
+
+def _report_to_excel_bytes(
+    report_df: pd.DataFrame,
+    period_name: str,
+    start_dt: pd.Timestamp,
+    end_dt_exclusive: pd.Timestamp,
+    search_text: str,
+) -> bytes:
+    meta_df = pd.DataFrame(
+        [
+            ["Период", period_name],
+            ["Дата начала", start_dt.strftime("%d.%m.%Y")],
+            ["Дата конца", (end_dt_exclusive - pd.Timedelta(days=1)).strftime("%d.%m.%Y")],
+            ["Поиск", _safe_str(search_text).strip() or "—"],
+            ["Сформирован", _sheet_datetime_now()],
+            ["Всего позиций", len(report_df)],
+            ["Всего продано", report_df["Продано"].sum() if not report_df.empty else 0],
+        ],
+        columns=["Параметр", "Значение"],
+    )
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        report_df.to_excel(writer, index=False, sheet_name=REPORT_EXPORT_SHEET)
+        meta_df.to_excel(writer, index=False, sheet_name=REPORT_META_SHEET)
+
+        ws = writer.sheets[REPORT_EXPORT_SHEET]
+        ws.freeze_panes = "A2"
+        ws.column_dimensions["A"].width = 60
+        ws.column_dimensions["B"].width = 14
+
+        ws_meta = writer.sheets[REPORT_META_SHEET]
+        ws_meta.column_dimensions["A"].width = 24
+        ws_meta.column_dimensions["B"].width = 30
+
+    output.seek(0)
+    return output.getvalue()
+
+
+def _make_report_id() -> str:
+    return f"RPT_{_now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def save_report_to_state_sheet(
+    report_df: pd.DataFrame,
+    period_name: str,
+    start_dt: pd.Timestamp,
+    end_dt_exclusive: pd.Timestamp,
+    search_text: str,
+) -> str:
+    try:
+        ws = get_state_worksheet()
+        report_id = _make_report_id()
+        created_at = _sheet_datetime_now()
+        end_inclusive = end_dt_exclusive - pd.Timedelta(days=1)
+
+        total_items = len(report_df)
+        total_sold = report_df["Продано"].sum() if not report_df.empty else 0
+
+        log_row = [
+            report_id,
+            created_at,
+            period_name,
+            start_dt.strftime("%d.%m.%Y"),
+            end_inclusive.strftime("%d.%m.%Y"),
+            _safe_str(search_text).strip(),
+            total_items,
+            total_sold,
+        ]
+
+        existing_log = ws.get("G2:G")
+        next_log_row = len(existing_log) + 2 if existing_log else 2
+
+        ws.update(
+            f"G{next_log_row}:N{next_log_row}",
+            [log_row],
+            value_input_option="RAW",
+        )
+
+        item_rows = []
+        for idx, row in enumerate(report_df.itertuples(index=False), start=1):
+            item_rows.append([
+                report_id,
+                idx,
+                _safe_str(row.Товар),
+                row.Продано,
+                "item",
+            ])
+
+        if item_rows:
+            existing_items = ws.get("P2:P")
+            next_item_row = len(existing_items) + 2 if existing_items else 2
+            end_row = next_item_row + len(item_rows) - 1
+            ws.update(
+                f"P{next_item_row}:T{end_row}",
+                item_rows,
+                value_input_option="RAW",
+            )
+
+        return report_id
+
+    except Exception as e:
+        st.warning(f"Не удалось сохранить отчёт в Sheets: {e}")
+        return ""
+
+
+@st.cache_data(ttl=60)
+def load_saved_reports() -> pd.DataFrame:
+    try:
+        ws = get_state_worksheet()
+        rows = ws.get("G1:N")
+        if not rows or len(rows) < 2:
+            return pd.DataFrame(columns=REPORT_LOG_HEADERS)
+
+        headers = rows[0]
+        data = [row + [""] * (len(headers) - len(row)) for row in rows[1:] if any(str(x).strip() for x in row)]
+        return pd.DataFrame(data, columns=headers)
+
+    except Exception:
+        return pd.DataFrame(columns=REPORT_LOG_HEADERS)
+
+
+@st.cache_data(ttl=60)
+def load_report_items(report_id: str) -> pd.DataFrame:
+    try:
+        ws = get_state_worksheet()
+        rows = ws.get("P1:T")
+        if not rows or len(rows) < 2:
+            return pd.DataFrame(columns=REPORT_ITEM_HEADERS)
+
+        headers = rows[0]
+        data = [row + [""] * (len(headers) - len(row)) for row in rows[1:] if any(str(x).strip() for x in row)]
+        df = pd.DataFrame(data, columns=headers)
+
+        if df.empty:
+            return df
+
+        df = df[df["report_id"].astype(str) == str(report_id)].copy()
+        if df.empty:
+            return df
+
+        df["sort_order"] = pd.to_numeric(df["sort_order"], errors="coerce").fillna(0)
+        df["sold"] = pd.to_numeric(df["sold"], errors="coerce").fillna(0)
+        df = df.sort_values(["sort_order"], ascending=[True]).reset_index(drop=True)
+        return df
+
+    except Exception:
+        return pd.DataFrame(columns=REPORT_ITEM_HEADERS)
+
+
+def build_saved_report_excel(report_meta: pd.Series, items_df: pd.DataFrame) -> bytes:
+    export_df = items_df[["product", "sold"]].rename(
+        columns={"product": "Товар", "sold": "Продано"}
+    )
+
+    meta_df = pd.DataFrame(
+        [
+            ["ID отчёта", report_meta.get("report_id", "")],
+            ["Создан", report_meta.get("created_at", "")],
+            ["Период", report_meta.get("period_name", "")],
+            ["Дата начала", report_meta.get("date_from", "")],
+            ["Дата конца", report_meta.get("date_to", "")],
+            ["Поиск", report_meta.get("search", "") or "—"],
+            ["Всего позиций", report_meta.get("total_items", 0)],
+            ["Всего продано", report_meta.get("total_sold", 0)],
+        ],
+        columns=["Параметр", "Значение"],
+    )
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export_df.to_excel(writer, index=False, sheet_name=REPORT_EXPORT_SHEET)
+        meta_df.to_excel(writer, index=False, sheet_name=REPORT_META_SHEET)
+
+        ws = writer.sheets[REPORT_EXPORT_SHEET]
+        ws.freeze_panes = "A2"
+        ws.column_dimensions["A"].width = 60
+        ws.column_dimensions["B"].width = 14
+
+        ws_meta = writer.sheets[REPORT_META_SHEET]
+        ws_meta.column_dimensions["A"].width = 24
+        ws_meta.column_dimensions["B"].width = 30
+
+    output.seek(0)
+    return output.getvalue()
+
+
 def render_report() -> None:
     st.title("📊 Отчёт по продажам")
-
-    report_df = _prepare_sales_report_df(work_base)
 
     if REPORT_DATE_COL not in work_base.columns:
         st.warning(f"В таблице не найден столбец «{REPORT_DATE_COL}».")
         return
 
+    report_df = _prepare_sales_report_df(work_base)
+
     st.caption(f"Отчёт строится по столбцу: **{REPORT_DATE_COL}**")
 
-    now_ts = pd.Timestamp(_now().replace(tzinfo=None))
-    today_start = now_ts.normalize()
-    tomorrow_start = today_start + pd.Timedelta(days=1)
+    ctrl_col1, ctrl_col2 = st.columns([2, 1])
 
-    week_start = today_start - pd.Timedelta(days=today_start.weekday())
-    next_week_start = week_start + pd.Timedelta(days=7)
+    with ctrl_col1:
+        period_mode = st.radio(
+            "Период отчёта",
+            ["За сегодня", "За неделю", "За месяц", "Произвольный период"],
+            horizontal=True,
+        )
 
-    month_start = today_start.replace(day=1)
-    next_month_start = month_start + pd.offsets.MonthBegin(1)
+    custom_start = None
+    custom_end = None
 
-    day_report = _build_period_report(report_df, today_start, tomorrow_start)
-    week_report = _build_period_report(report_df, week_start, next_week_start)
-    month_report = _build_period_report(report_df, month_start, next_month_start)
+    if period_mode == "Произвольный период":
+        date_col1, date_col2 = st.columns(2)
+        with date_col1:
+            custom_start = st.date_input("Дата начала", value=_now().date(), key="report_custom_start")
+        with date_col2:
+            custom_end = st.date_input("Дата конца", value=_now().date(), key="report_custom_end")
 
-    tabs = st.tabs(["За день", "За неделю", "За месяц"])
+    with ctrl_col2:
+        search_text = st.text_input(
+            "🔎 Поиск позиции",
+            placeholder="Введите название товара",
+            key="report_search_text",
+        )
 
-    with tabs[0]:
-        st.subheader("Продано за сегодня")
-        if day_report.empty:
-            st.info("За сегодня продаж нет.")
-        else:
-            st.dataframe(day_report, use_container_width=True, hide_index=True)
+    start_dt, end_dt_exclusive, period_name = _get_report_period_bounds(
+        period_mode,
+        custom_start,
+        custom_end,
+    )
 
-    with tabs[1]:
-        st.subheader("Продано за текущую неделю")
-        if week_report.empty:
-            st.info("За текущую неделю продаж нет.")
-        else:
-            st.dataframe(week_report, use_container_width=True, hide_index=True)
+    result_df = _build_period_report(report_df, start_dt, end_dt_exclusive)
+    result_df = _apply_report_search(result_df, search_text)
+    result_df = result_df.sort_values(["Продано", "Товар"], ascending=[False, True]).reset_index(drop=True)
 
-    with tabs[2]:
-        st.subheader("Продано за текущий месяц")
-        if month_report.empty:
-            st.info("За текущий месяц продаж нет.")
-        else:
-            st.dataframe(month_report, use_container_width=True, hide_index=True)
+    total_sold = result_df["Продано"].sum() if not result_df.empty else 0
+    total_items = len(result_df)
+    top_item = result_df.iloc[0]["Товар"] if not result_df.empty else "—"
+
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("Продано всего", total_sold)
+    metric2.metric("Позиций", total_items)
+    metric3.metric("Топ позиция", top_item)
+
+    st.info(f"Период: **{_format_period_caption(start_dt, end_dt_exclusive)}**")
+
+    action_col1, action_col2 = st.columns(2)
+
+    with action_col1:
+        if st.button("💾 Сохранить отчёт в архив", use_container_width=True, type="primary"):
+            report_id = save_report_to_state_sheet(
+                report_df=result_df,
+                period_name=period_name,
+                start_dt=start_dt,
+                end_dt_exclusive=end_dt_exclusive,
+                search_text=search_text,
+            )
+            if report_id:
+                load_saved_reports.clear()
+                load_report_items.clear()
+                st.success(f"Отчёт сохранён в архив: {report_id}")
+
+    with action_col2:
+        excel_bytes = _report_to_excel_bytes(
+            report_df=result_df,
+            period_name=period_name,
+            start_dt=start_dt,
+            end_dt_exclusive=end_dt_exclusive,
+            search_text=search_text,
+        )
+        st.download_button(
+            "⬇️ Скачать текущий Excel",
+            data=excel_bytes,
+            file_name=_build_report_filename(period_name, start_dt, end_dt_exclusive),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    if result_df.empty:
+        st.warning("По выбранному периоду и фильтру данных нет.")
+    else:
+        st.dataframe(
+            result_df,
+            use_container_width=True,
+            hide_index=True,
+            height=650,
+            column_config={
+                "Товар": st.column_config.TextColumn("Товар", width="large"),
+                "Продано": st.column_config.NumberColumn("Продано", format="%.3f"),
+            },
+        )
+
+    st.markdown("---")
+    st.subheader("🗂 Архив отчётов")
+
+    saved_reports = load_saved_reports()
+
+    if saved_reports.empty:
+        st.info("Архив отчётов пока пуст.")
+        return
+
+    saved_reports = saved_reports.sort_values(["created_at"], ascending=[False]).reset_index(drop=True)
+
+    display_options = [
+        f"{row['report_id']} | {row['created_at']} | {row['period_name']} | {row['date_from']} - {row['date_to']}"
+        for _, row in saved_reports.iterrows()
+    ]
+
+    selected_label = st.selectbox("Выберите сохранённый отчёт", display_options)
+    selected_idx = display_options.index(selected_label)
+    selected_meta = saved_reports.iloc[selected_idx]
+
+    items_df = load_report_items(selected_meta["report_id"])
+
+    if items_df.empty:
+        st.warning("Для выбранного отчёта не найдены строки товаров.")
+        return
+
+    preview_df = items_df[["product", "sold"]].rename(columns={"product": "Товар", "sold": "Продано"})
+    preview_df = preview_df.sort_values(["Продано", "Товар"], ascending=[False, True]).reset_index(drop=True)
+
+    st.dataframe(preview_df, use_container_width=True, hide_index=True, height=400)
+
+    saved_excel = build_saved_report_excel(selected_meta, items_df)
+    st.download_button(
+        "⬇️ Скачать сохранённый отчёт",
+        data=saved_excel,
+        file_name=f"{selected_meta['report_id']}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key=f"download_saved_{selected_meta['report_id']}",
+    )
 
 
 # ── АВТООБНОВЛЕНИЕ ────────────────────────────────────────────────────────────
@@ -784,6 +1179,8 @@ def render_sidebar() -> str:
     if st.sidebar.button("🔃 Обновить данные сейчас"):
         load_data.clear()
         load_state_from_sheets.clear()
+        load_saved_reports.clear()
+        load_report_items.clear()
         st.rerun()
 
     st.sidebar.markdown("---")
