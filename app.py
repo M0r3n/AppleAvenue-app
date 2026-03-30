@@ -20,24 +20,25 @@ from google.oauth2.credentials import Credentials
 from streamlit_autorefresh import st_autorefresh
 
 # ── КОНСТАНТЫ ─────────────────────────────────────────────────────────────────
-SHEET_ID        = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
-TAB_NAME        = "Заказы ИМ Авеню"
-STATE_TAB_NAME  = "avenue_state"
-PZ_LIST         = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
-START_ROW       = 26596
-TRUE_VAL        = "TRUE"
-FALSE_VAL       = "FALSE"
-COOKIE_NAME     = "avenue_auth_status"
-COOKIE_DAYS     = 30
-REFRESH_MS      = 600_000
-PREVIEW_ORDERS  = 50
-STORE_GORB      = "Горбушка"
-STORE_PEKIN     = "Пекин"
-STORE_TIK       = "ТИК"
-CANCELLED_VAL   = "Отменён"
-STATE_SYNC_TTL  = 15
-REPORT_PAGE_KEY = "report_page_open"
-REPORT_DATE_COL = "Дата и время сбора заказа"
+SHEET_ID                = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
+TAB_NAME                = "Заказы ИМ Авеню"
+STATE_TAB_NAME          = "avenue_state"
+PZ_LIST                 = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
+START_ROW               = 26596
+TRUE_VAL                = "TRUE"
+FALSE_VAL               = "FALSE"
+COOKIE_NAME             = "avenue_auth_status"
+COOKIE_DAYS             = 30
+REFRESH_MS              = 600_000
+PREVIEW_ORDERS          = 50
+STORE_GORB              = "Горбушка"
+STORE_PEKIN             = "Пекин"
+STORE_TIK               = "ТИК"
+CANCELLED_VAL           = "Отменён"
+STATE_SYNC_TTL          = 15
+REPORT_PAGE_KEY         = "report_page_open"
+REPORT_DATE_COL         = "Дата и время сбора заказа"
+REPORT_DATE_COL_LETTER  = "R"
 
 _PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
 _GORB_KEYWORDS  = ("горб", "грб", "gorb")
@@ -64,6 +65,15 @@ def _now() -> datetime:
 
 def _sheet_datetime_now() -> str:
     return _now().strftime("%d.%m.%Y %H:%M:%S")
+
+
+def _col_letter_to_index(letter: str) -> int:
+    result = 0
+    for ch in letter.strip().upper():
+        if not ("A" <= ch <= "Z"):
+            raise ValueError(f"Некорректная буква колонки: {letter}")
+        result = result * 26 + (ord(ch) - ord("A") + 1)
+    return result - 1
 
 
 def _safe_str(value: Any) -> str:
@@ -289,12 +299,9 @@ def save_state_to_sheets() -> None:
         rows += list(map(list, zip(pad(in_work), pad(reviewed), pad(confirmed), pad(log))))
 
         ws = get_state_worksheet()
-
-        # Без clear(): меньше риск гонок и меньше лишних запросов.
         end_row = len(rows)
         ws.update(f"A1:D{end_row}", rows, value_input_option="RAW")
 
-        # Очищаем хвост старых данных, если новый набор короче предыдущего.
         existing_rows = ws.row_count
         if existing_rows > end_row:
             ws.batch_clear([f"A{end_row + 1}:D{existing_rows}"])
@@ -308,10 +315,6 @@ def save_state_to_sheets() -> None:
 
 @st.cache_data(ttl=3600)
 def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
-    """
-    Загружает данные из листа заказов.
-    Интерфейс и бизнес-логика сохранены как были.
-    """
     try:
         sheet = get_orders_worksheet()
         raw_data = sheet.get_all_values()
@@ -354,7 +357,7 @@ def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
             "MOVE":      col_idx("Перемещение"),
             "DONE":      col_idx("Собрано"),
             "STATUS":    status_idx,
-            "REPORT_DT": col_idx(REPORT_DATE_COL),
+            "REPORT_DT": _col_letter_to_index(REPORT_DATE_COL_LETTER),
         }
     except ValueError as e:
         st.error(str(e))
@@ -394,8 +397,6 @@ def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: di
     except Exception as e:
         st.warning(f"Не удалось обновить данные в Sheets: {e}")
 
-
-# ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
 
 def _review_key(oid: Any, edit_text: str) -> str:
     return f"{_safe_str(oid)}||{_normalized_str(edit_text)}"
@@ -474,10 +475,6 @@ def _to_numeric_qty(series: pd.Series) -> pd.Series:
 
 
 def _prepare_sales_report_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Для отчёта берём только собранные и не отменённые позиции.
-    Дата продажи = 'Дата и время сбора заказа'.
-    """
     if REPORT_DATE_COL not in df.columns:
         return pd.DataFrame()
 
@@ -572,7 +569,6 @@ def render_report() -> None:
             st.dataframe(month_report, use_container_width=True, hide_index=True)
 
 
-# ── АВТООБНОВЛЕНИЕ ────────────────────────────────────────────────────────────
 st.session_state.setdefault("auto_refresh_enabled", True)
 
 refresh_count = (
@@ -581,7 +577,6 @@ refresh_count = (
     else 0
 )
 
-# ── ИНИЦИАЛИЗАЦИЯ СЕССИИ ──────────────────────────────────────────────────────
 if "session_initialized" not in st.session_state:
     _sync_runtime_state()
     st.session_state.prev_order_ids = set()
@@ -596,7 +591,6 @@ else:
 if refresh_count > 0:
     load_data.clear()
 
-# ── ЗАГРУЗКА И ПОДГОТОВКА ДАННЫХ ──────────────────────────────────────────────
 df_mem, C = load_data()
 
 if df_mem.empty or not C:
@@ -636,7 +630,6 @@ COL_RENAME = {
     C_COMMENT: "Коммент",
 }
 
-# Оповещения о новых заказах
 current_order_ids = set(df_mem[C_ORDER].dropna().astype(str).unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
@@ -645,14 +638,12 @@ if st.session_state.prev_order_ids:
         st.session_state.new_orders_alert_time = _now()
 st.session_state.prev_order_ids = current_order_ids
 
-# Вычисляемые колонки
 work_base = df_mem.copy()
 work_base["_target_store"] = work_base[C_COMMENT].apply(identify_target_store)
 work_base["_is_cancelled"] = (
     work_base[C_STATUS].astype(str).str.strip().str.lower() == CANCELLED_VAL.lower()
 )
 
-# ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
 
 st.session_state.auto_refresh_enabled = st.sidebar.toggle(
@@ -681,7 +672,6 @@ if st.sidebar.button("📊 Отчёт", use_container_width=True):
     st.session_state[REPORT_PAGE_KEY] = True
     st.rerun()
 
-# ── ЛОГИКА МАГАЗИНА ───────────────────────────────────────────────────────────
 
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
@@ -905,8 +895,6 @@ def render_store(current_store: str) -> None:
         for oid, group in right_df.groupby(C_ORDER, sort=False):
             _render_order(oid, group, in_work_section=True)
 
-
-# ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
 
 if st.session_state.get(REPORT_PAGE_KEY):
     render_report()
