@@ -1,6 +1,6 @@
 """
 Авеню: Система Заказов
-v4.5 — безопасный рефакторинг без изменения UI/логики.
+v4.6 — безопасная чистка и оптимизация без изменения UI/логики.
 
 Что улучшено:
 - код структурирован по блокам;
@@ -8,17 +8,8 @@ v4.5 — безопасный рефакторинг без изменения U
 - добавлены более безопасные helper-функции;
 - обновления в Google Sheets по-прежнему точечные;
 - время записи по МСК сохраняется строкой без авто-конвертации Sheets;
-- сохранён текущий UI, сценарии и бизнес-логика.
-
-Изменения в разделе "Отчёт":
-- улучшено отображение таблицы;
-- добавлен выбор периода отчёта;
-- добавлен произвольный диапазон дат;
-- добавлен поиск по позиции;
-- позиции сортируются по количеству продаж (по убыванию);
-- добавлено сохранение отчёта в archive-блок листа avenue_state;
-- добавана возможность скачать как текущий, так и сохранённый отчёт в Excel;
-- отчёты хранятся бессрочно в Google Sheets.
+- сохранён текущий UI, сценарии и бизнес-логика;
+- повышена стабильность загрузки/sync/report/archive/export.
 """
 
 from __future__ import annotations
@@ -193,6 +184,36 @@ def _bool_series_eq(series: pd.Series, expected: str) -> pd.Series:
 
 def _safe_unique_str_set(series: pd.Series) -> set[str]:
     return set(series.dropna().astype(str).unique())
+
+
+def _non_empty_str_list(values: Iterable[Any]) -> list[str]:
+    return [_safe_str(x) for x in values if _normalized_str(x)]
+
+
+def _next_data_row(values: list[list[str]]) -> int:
+    if not values:
+        return 2
+    non_empty_rows = [row for row in values if any(_normalized_str(cell) for cell in row)]
+    return len(non_empty_rows) + 2
+
+
+def _clear_order_cache() -> None:
+    load_data.clear()
+
+
+def _clear_state_cache() -> None:
+    load_state_from_sheets.clear()
+
+
+def _clear_report_caches() -> None:
+    load_saved_reports.clear()
+    load_report_items.clear()
+
+
+def _clear_all_runtime_caches() -> None:
+    _clear_order_cache()
+    _clear_state_cache()
+    _clear_report_caches()
 
 
 # ── COOKIE / АВТОРИЗАЦИЯ ──────────────────────────────────────────────────────
@@ -401,10 +422,10 @@ def load_state_from_sheets() -> dict[str, Any]:
 
 def save_state_to_sheets() -> None:
     try:
-        in_work = sorted(_safe_str(x) for x in st.session_state.local_in_work if _normalized_str(x))
-        reviewed = sorted(_safe_str(x) for x in st.session_state.reviewed_changes if _normalized_str(x))
-        confirmed = sorted(_safe_str(x) for x in st.session_state.confirmed_cancels if _normalized_str(x))
-        log = [_safe_str(x) for x in st.session_state.completed_log if _normalized_str(x)]
+        in_work = sorted(_non_empty_str_list(st.session_state.local_in_work))
+        reviewed = sorted(_non_empty_str_list(st.session_state.reviewed_changes))
+        confirmed = sorted(_non_empty_str_list(st.session_state.confirmed_cancels))
+        log = _non_empty_str_list(st.session_state.completed_log)
 
         max_len = max(len(in_work), len(reviewed), len(confirmed), len(log), 1)
 
@@ -423,7 +444,7 @@ def save_state_to_sheets() -> None:
         if existing_rows > end_row:
             ws.batch_clear([f"A{end_row + 1}:D{existing_rows}"])
 
-        load_state_from_sheets.clear()
+        _clear_state_cache()
 
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
@@ -528,10 +549,6 @@ def _build_batch_payload_for_rows(
     return [{"range": f"{col_letter}{int(row_num)}", "values": [[value]]} for row_num in row_numbers]
 
 
-def _clear_data_cache_after_update() -> None:
-    load_data.clear()
-
-
 def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: dict[str, str]) -> None:
     try:
         sheet = get_orders_worksheet()
@@ -545,7 +562,7 @@ def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: di
 
         if batch_payload:
             sheet.batch_update(batch_payload, value_input_option="RAW")
-            _clear_data_cache_after_update()
+            _clear_order_cache()
 
     except Exception as e:
         st.warning(f"Не удалось обновить данные в Sheets: {e}")
@@ -560,7 +577,7 @@ def write_report_datetime(group: pd.DataFrame, col_map: dict[str, int], dt_value
         batch_payload = _build_batch_payload_for_rows(row_numbers, report_col, dt_value)
         if batch_payload:
             sheet.batch_update(batch_payload, value_input_option="RAW")
-            _clear_data_cache_after_update()
+            _clear_order_cache()
 
     except Exception as e:
         st.warning(f"Не удалось записать дату сборки: {e}")
@@ -739,26 +756,40 @@ def _build_report_filename(period_name: str, start_dt: pd.Timestamp, end_dt_excl
     )
 
 
-def _report_to_excel_bytes(
-    report_df: pd.DataFrame,
+def _build_report_meta_df(
+    *,
     period_name: str,
     start_dt: pd.Timestamp,
     end_dt_exclusive: pd.Timestamp,
     search_text: str,
-) -> bytes:
-    meta_df = pd.DataFrame(
+    created_at: str | None = None,
+    report_id: str | None = None,
+    total_items: Any = 0,
+    total_sold: Any = 0,
+) -> pd.DataFrame:
+    rows: list[list[Any]] = []
+
+    if report_id is not None:
+        rows.append(["ID отчёта", report_id])
+    if created_at is not None:
+        rows.append(["Создан", created_at])
+
+    rows.extend(
         [
             ["Период", period_name],
             ["Дата начала", start_dt.strftime("%d.%m.%Y")],
             ["Дата конца", (end_dt_exclusive - pd.Timedelta(days=1)).strftime("%d.%m.%Y")],
             ["Поиск", _safe_str(search_text).strip() or "—"],
             ["Сформирован", _sheet_datetime_now()],
-            ["Всего позиций", len(report_df)],
-            ["Всего продано", report_df["Продано"].sum() if not report_df.empty else 0],
-        ],
-        columns=["Параметр", "Значение"],
+            ["Всего позиций", total_items],
+            ["Всего продано", total_sold],
+        ]
     )
 
+    return pd.DataFrame(rows, columns=["Параметр", "Значение"])
+
+
+def _write_excel_bytes(report_df: pd.DataFrame, meta_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         report_df.to_excel(writer, index=False, sheet_name=REPORT_EXPORT_SHEET)
@@ -775,6 +806,25 @@ def _report_to_excel_bytes(
 
     output.seek(0)
     return output.getvalue()
+
+
+def _report_to_excel_bytes(
+    report_df: pd.DataFrame,
+    period_name: str,
+    start_dt: pd.Timestamp,
+    end_dt_exclusive: pd.Timestamp,
+    search_text: str,
+) -> bytes:
+    total_sold = report_df["Продано"].sum() if not report_df.empty else 0
+    meta_df = _build_report_meta_df(
+        period_name=period_name,
+        start_dt=start_dt,
+        end_dt_exclusive=end_dt_exclusive,
+        search_text=search_text,
+        total_items=len(report_df),
+        total_sold=total_sold,
+    )
+    return _write_excel_bytes(report_df, meta_df)
 
 
 def _make_report_id() -> str:
@@ -808,8 +858,7 @@ def save_report_to_state_sheet(
             total_sold,
         ]
 
-        existing_log = ws.get("G2:G")
-        next_log_row = len(existing_log) + 2 if existing_log else 2
+        next_log_row = _next_data_row(ws.get("G2:N"))
 
         ws.update(
             f"G{next_log_row}:N{next_log_row}",
@@ -817,7 +866,7 @@ def save_report_to_state_sheet(
             value_input_option="RAW",
         )
 
-        item_rows = []
+        item_rows: list[list[Any]] = []
         for idx, row in enumerate(report_df.itertuples(index=False), start=1):
             item_rows.append([
                 report_id,
@@ -828,8 +877,7 @@ def save_report_to_state_sheet(
             ])
 
         if item_rows:
-            existing_items = ws.get("P2:P")
-            next_item_row = len(existing_items) + 2 if existing_items else 2
+            next_item_row = _next_data_row(ws.get("P2:T"))
             end_row = next_item_row + len(item_rows) - 1
             ws.update(
                 f"P{next_item_row}:T{end_row}",
@@ -854,7 +902,25 @@ def load_saved_reports() -> pd.DataFrame:
 
         headers = rows[0]
         data = [row + [""] * (len(headers) - len(row)) for row in rows[1:] if any(str(x).strip() for x in row)]
-        return pd.DataFrame(data, columns=headers)
+        df = pd.DataFrame(data, columns=headers)
+
+        if df.empty:
+            return df
+
+        for col in ("total_items", "total_sold"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        if "created_at" in df.columns:
+            df["_created_at_dt"] = pd.to_datetime(
+                df["created_at"].astype(str).str.strip(),
+                errors="coerce",
+                dayfirst=True,
+            )
+        else:
+            df["_created_at_dt"] = pd.NaT
+
+        return df
 
     except Exception:
         return pd.DataFrame(columns=REPORT_LOG_HEADERS)
@@ -893,36 +959,31 @@ def build_saved_report_excel(report_meta: pd.Series, items_df: pd.DataFrame) -> 
         columns={"product": "Товар", "sold": "Продано"}
     )
 
-    meta_df = pd.DataFrame(
-        [
-            ["ID отчёта", report_meta.get("report_id", "")],
-            ["Создан", report_meta.get("created_at", "")],
-            ["Период", report_meta.get("period_name", "")],
-            ["Дата начала", report_meta.get("date_from", "")],
-            ["Дата конца", report_meta.get("date_to", "")],
-            ["Поиск", report_meta.get("search", "") or "—"],
-            ["Всего позиций", report_meta.get("total_items", 0)],
-            ["Всего продано", report_meta.get("total_sold", 0)],
-        ],
-        columns=["Параметр", "Значение"],
+    try:
+        start_dt = pd.to_datetime(_safe_str(report_meta.get("date_from", "")), dayfirst=True, errors="coerce")
+        end_dt = pd.to_datetime(_safe_str(report_meta.get("date_to", "")), dayfirst=True, errors="coerce")
+    except Exception:
+        start_dt = pd.NaT
+        end_dt = pd.NaT
+
+    if pd.notna(start_dt) and pd.notna(end_dt):
+        end_dt_exclusive = end_dt + pd.Timedelta(days=1)
+    else:
+        start_dt = pd.Timestamp(_now().replace(tzinfo=None)).normalize()
+        end_dt_exclusive = start_dt + pd.Timedelta(days=1)
+
+    meta_df = _build_report_meta_df(
+        report_id=_safe_str(report_meta.get("report_id", "")),
+        created_at=_safe_str(report_meta.get("created_at", "")),
+        period_name=_safe_str(report_meta.get("period_name", "")),
+        start_dt=start_dt,
+        end_dt_exclusive=end_dt_exclusive,
+        search_text=_safe_str(report_meta.get("search", "")),
+        total_items=report_meta.get("total_items", 0),
+        total_sold=report_meta.get("total_sold", 0),
     )
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name=REPORT_EXPORT_SHEET)
-        meta_df.to_excel(writer, index=False, sheet_name=REPORT_META_SHEET)
-
-        ws = writer.sheets[REPORT_EXPORT_SHEET]
-        ws.freeze_panes = "A2"
-        ws.column_dimensions["A"].width = 60
-        ws.column_dimensions["B"].width = 14
-
-        ws_meta = writer.sheets[REPORT_META_SHEET]
-        ws_meta.column_dimensions["A"].width = 24
-        ws_meta.column_dimensions["B"].width = 30
-
-    output.seek(0)
-    return output.getvalue()
+    return _write_excel_bytes(export_df, meta_df)
 
 
 def render_report() -> None:
@@ -995,8 +1056,7 @@ def render_report() -> None:
                 search_text=search_text,
             )
             if report_id:
-                load_saved_reports.clear()
-                load_report_items.clear()
+                _clear_report_caches()
                 st.success(f"Отчёт сохранён в архив: {report_id}")
 
     with action_col2:
@@ -1038,7 +1098,14 @@ def render_report() -> None:
         st.info("Архив отчётов пока пуст.")
         return
 
-    saved_reports = saved_reports.sort_values(["created_at"], ascending=[False]).reset_index(drop=True)
+    if "_created_at_dt" in saved_reports.columns:
+        saved_reports = saved_reports.sort_values(
+            by=["_created_at_dt", "created_at"],
+            ascending=[False, False],
+            na_position="last",
+        ).reset_index(drop=True)
+    else:
+        saved_reports = saved_reports.sort_values(["created_at"], ascending=[False]).reset_index(drop=True)
 
     display_options = [
         f"{row['report_id']} | {row['created_at']} | {row['period_name']} | {row['date_from']} - {row['date_to']}"
@@ -1098,7 +1165,7 @@ def _init_session_state() -> None:
 _init_session_state()
 
 if refresh_count > 0:
-    load_data.clear()
+    _clear_order_cache()
 
 
 # ── ПОДГОТОВКА DF ─────────────────────────────────────────────────────────────
@@ -1177,10 +1244,7 @@ def render_sidebar() -> str:
     st.sidebar.caption(f"🔄 Последняя синхронизация: **{st.session_state.last_sync}**")
 
     if st.sidebar.button("🔃 Обновить данные сейчас"):
-        load_data.clear()
-        load_state_from_sheets.clear()
-        load_saved_reports.clear()
-        load_report_items.clear()
+        _clear_all_runtime_caches()
         st.rerun()
 
     st.sidebar.markdown("---")
