@@ -62,6 +62,10 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _sheet_datetime_now() -> str:
+    return _now().strftime("%d.%m.%Y %H:%M:%S")
+
+
 def _safe_str(value: Any) -> str:
     if value is None:
         return ""
@@ -340,16 +344,17 @@ def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
     try:
         status_idx = headers.index("Статус") if "Статус" in headers else len(headers) - 1
         col_map = {
-            "ORDER":   col_idx("Наименование") - 1,
-            "PRODUCT": col_idx("Наименование"),
-            "QTY":     col_idx("Кол-во"),
-            "WH":      col_idx("Склад"),
-            "COMMENT": col_idx("Комментарий"),
-            "EDIT":    col_idx("Изменения заказа"),
-            "INWORK":  col_idx("Под ЗАКАЗ"),
-            "MOVE":    col_idx("Перемещение"),
-            "DONE":    col_idx("Собрано"),
-            "STATUS":  status_idx,
+            "ORDER":     col_idx("Наименование") - 1,
+            "PRODUCT":   col_idx("Наименование"),
+            "QTY":       col_idx("Кол-во"),
+            "WH":        col_idx("Склад"),
+            "COMMENT":   col_idx("Комментарий"),
+            "EDIT":      col_idx("Изменения заказа"),
+            "INWORK":    col_idx("Под ЗАКАЗ"),
+            "MOVE":      col_idx("Перемещение"),
+            "DONE":      col_idx("Собрано"),
+            "STATUS":    status_idx,
+            "REPORT_DT": col_idx(REPORT_DATE_COL),
         }
     except ValueError as e:
         st.error(str(e))
@@ -824,7 +829,15 @@ def render_store(current_store: str) -> None:
                         type="primary",
                         use_container_width=True,
                     ):
-                        update_sheet_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
+                        update_sheet_cells(
+                            group,
+                            C,
+                            {
+                                "DONE": TRUE_VAL,
+                                "MOVE": FALSE_VAL,
+                                "REPORT_DT": _sheet_datetime_now(),
+                            },
+                        )
                         st.session_state.local_in_work.discard(oid_str)
                         _log_action(oid_str, group, current_store, "done")
                         save_state_to_sheets()
@@ -850,7 +863,15 @@ def render_store(current_store: str) -> None:
                         type="primary",
                         use_container_width=True,
                     ):
-                        update_sheet_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
+                        update_sheet_cells(
+                            group,
+                            C,
+                            {
+                                "DONE": TRUE_VAL,
+                                "MOVE": FALSE_VAL,
+                                "REPORT_DT": _sheet_datetime_now(),
+                            },
+                        )
                         st.session_state.local_in_work.discard(oid_str)
                         st.session_state.reviewed_changes.discard(rk)
                         _log_action(oid_str, group, current_store, "done")
