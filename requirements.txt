@@ -4,3 +4,4 @@ pandas
 google-auth
 extra-streamlit-components
 streamlit-autorefresh
+openpyxl
