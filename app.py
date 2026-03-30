@@ -1,7 +1,6 @@
 """
 Авеню: Система Заказов
 v4.1 — безопасный рефакторинг без изменения UI/логики.
-+ отчёты по продажам
 """
 
 from __future__ import annotations
@@ -10,7 +9,6 @@ import base64
 import hashlib
 import hmac
 import json
-import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -22,27 +20,25 @@ from google.oauth2.credentials import Credentials
 from streamlit_autorefresh import st_autorefresh
 
 # ── КОНСТАНТЫ ─────────────────────────────────────────────────────────────────
-SHEET_ID = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
-TAB_NAME = "Заказы ИМ Авеню"
-STATE_TAB_NAME = "avenue_state"
-SALES_STATE_TAB_NAME = "avenue_sales_state"
-
-PZ_LIST = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
-START_ROW = 26596
-TRUE_VAL = "TRUE"
-FALSE_VAL = "FALSE"
-COOKIE_NAME = "avenue_auth_status"
-COOKIE_DAYS = 30
-REFRESH_MS = 600_000
-PREVIEW_ORDERS = 50
-STORE_GORB = "Горбушка"
-STORE_PEKIN = "Пекин"
-STORE_TIK = "ТИК"
-CANCELLED_VAL = "Отменён"
-STATE_SYNC_TTL = 15
+SHEET_ID        = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
+TAB_NAME        = "Заказы ИМ Авеню"
+STATE_TAB_NAME  = "avenue_state"
+PZ_LIST         = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
+START_ROW       = 26596
+TRUE_VAL        = "TRUE"
+FALSE_VAL       = "FALSE"
+COOKIE_NAME     = "avenue_auth_status"
+COOKIE_DAYS     = 30
+REFRESH_MS      = 600_000
+PREVIEW_ORDERS  = 50
+STORE_GORB      = "Горбушка"
+STORE_PEKIN     = "Пекин"
+STORE_TIK       = "ТИК"
+CANCELLED_VAL   = "Отменён"
+STATE_SYNC_TTL  = 15
 
 _PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
-_GORB_KEYWORDS = ("горб", "грб", "gorb")
+_GORB_KEYWORDS  = ("горб", "грб", "gorb")
 
 MENU_OPTIONS = [
     "🏪 Магазин: ГОРБУШКА",
@@ -51,11 +47,9 @@ MENU_OPTIONS = [
     "⏳ Товар Под заказ",
     "✅ Выполненные сборки",
     "🚫 Отмененные заказы",
-    "📊 Отчёты по продажам",
 ]
 
 STATE_HEADERS = ["local_in_work", "reviewed_changes", "confirmed_cancels", "completed_log"]
-SALES_STATE_HEADERS = ["kind", "key", "payload", "updated_at"]
 
 # ── НАСТРОЙКА СТРАНИЦЫ ────────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
@@ -133,146 +127,6 @@ def _ensure_row_width(row: list[str], width: int) -> list[str]:
     if len(row) >= width:
         return row[:width]
     return row + [""] * (width - len(row))
-
-
-def _parse_qty(value: Any) -> int:
-    s = _safe_str(value).strip().replace(",", ".")
-    if not s:
-        return 0
-    m = re.search(r"-?\d+(?:\.\d+)?", s)
-    if not m:
-        return 0
-    try:
-        return int(float(m.group(0)))
-    except Exception:
-        return 0
-
-
-def _normalize_product_name(value: Any) -> str:
-    s = _safe_str(value).strip()
-    return re.sub(r"\s+", " ", s)
-
-
-def _first_regex_group(pattern: str, text: str) -> str | None:
-    m = re.search(pattern, text, flags=re.I)
-    if not m:
-        return None
-    return m.group(1).strip() if m.groups() else m.group(0).strip()
-
-
-def classify_product(product_name: str) -> dict[str, str]:
-    """
-    section  -> devices / accessories / other
-    category -> укрупнённая категория
-    model    -> модель/тип для отчёта
-    """
-    raw = _normalize_product_name(product_name)
-    p = raw.lower()
-
-    # AirPods считаем девайсом
-    airpods = _first_regex_group(r"\b(AirPods(?:\s*Pro|\s*Max)?)\b", raw)
-    if airpods:
-        return {
-            "section": "devices",
-            "category": "AirPods",
-            "model": re.sub(r"\s+", " ", airpods).strip(),
-        }
-
-    iphone = _first_regex_group(r"\b(iPhone\s*\d{1,2}\s*(?:Pro\s*Max|Pro|Max|Plus|Mini|e)?)\b", raw)
-    if iphone:
-        return {
-            "section": "devices",
-            "category": "iPhone",
-            "model": re.sub(r"\s+", " ", iphone).strip(),
-        }
-
-    ipad = _first_regex_group(r"\b(iPad(?:\s*(?:Pro|Air|Mini))?)\b", raw)
-    if ipad:
-        return {
-            "section": "devices",
-            "category": "iPad",
-            "model": re.sub(r"\s+", " ", ipad).strip(),
-        }
-
-    macbook = _first_regex_group(r"\b(MacBook(?:\s*(?:Air|Pro))?)\b", raw)
-    if macbook:
-        return {
-            "section": "devices",
-            "category": "MacBook",
-            "model": re.sub(r"\s+", " ", macbook).strip(),
-        }
-
-    watch = _first_regex_group(r"\b(Apple\s*Watch(?:\s*Series\s*\d+)?|Watch\s*Series\s*\d+)\b", raw)
-    if watch:
-        return {
-            "section": "devices",
-            "category": "Apple Watch",
-            "model": re.sub(r"\s+", " ", watch).strip(),
-        }
-
-    dyson = _first_regex_group(r"\b(Dyson\s+[A-Za-z0-9\.\- ]+)\b", raw)
-    if dyson:
-        return {
-            "section": "devices",
-            "category": "Dyson",
-            "model": re.sub(r"\s+", " ", dyson).strip(),
-        }
-
-    samsung = _first_regex_group(r"\b(Samsung\s+Galaxy\s+[A-Za-z0-9\-\+ ]+)\b", raw)
-    if samsung:
-        return {
-            "section": "devices",
-            "category": "Samsung",
-            "model": re.sub(r"\s+", " ", samsung).strip(),
-        }
-
-    xiaomi = _first_regex_group(r"\b(Xiaomi\s+[A-Za-z0-9\-\+ ]+)\b", raw)
-    if xiaomi:
-        return {
-            "section": "devices",
-            "category": "Xiaomi",
-            "model": re.sub(r"\s+", " ", xiaomi).strip(),
-        }
-
-    honor = _first_regex_group(r"\b(Honor\s+[A-Za-z0-9\-\+ ]+)\b", raw)
-    if honor:
-        return {
-            "section": "devices",
-            "category": "Honor",
-            "model": re.sub(r"\s+", " ", honor).strip(),
-        }
-
-    accessory_map = [
-        ("Чехлы", ["чехол", "case", "smart case", "flip case", "книжка", "накладка", "бампер"]),
-        ("Зарядки", ["заряд", "adapter", "адаптер", "magsafe", "mag safe", "блок питания", "сзу"]),
-        ("Кабели", ["кабель", "cable", "провод", "usb-c", "lightning", "type-c"]),
-        ("Держатели", ["держател", "holder", "подставк", "stand", "кронштейн"]),
-        ("Стёкла/плёнки", ["стекл", "glass", "пленк", "плёнк"]),
-        ("Стилусы", ["pencil", "stylus", "стилус"]),
-        ("Клавиатуры", ["keyboard", "клавиатур"]),
-        ("Ремешки", ["ремеш", "strap", "loop", "браслет"]),
-        ("Аккумуляторы/Powerbank", ["powerbank", "павербанк", "аккумулятор"]),
-    ]
-    for acc_type, keywords in accessory_map:
-        if any(k in p for k in keywords):
-            return {
-                "section": "accessories",
-                "category": "Аксессуары",
-                "model": acc_type,
-            }
-
-    if "iphone" in p:
-        return {"section": "devices", "category": "iPhone", "model": "iPhone"}
-    if "ipad" in p:
-        return {"section": "devices", "category": "iPad", "model": "iPad"}
-    if "airpods" in p:
-        return {"section": "devices", "category": "AirPods", "model": "AirPods"}
-
-    return {
-        "section": "other",
-        "category": "Прочее",
-        "model": raw[:80] if raw else "Неизвестно",
-    }
 
 
 # ── АВТОРИЗАЦИЯ ───────────────────────────────────────────────────────────────
@@ -379,17 +233,6 @@ def get_state_worksheet() -> gspread.Worksheet:
         return ws
 
 
-@st.cache_resource
-def get_sales_state_worksheet() -> gspread.Worksheet:
-    ss = get_spreadsheet()
-    try:
-        return ss.worksheet(SALES_STATE_TAB_NAME)
-    except gspread.WorksheetNotFound:
-        ws = ss.add_worksheet(title=SALES_STATE_TAB_NAME, rows=20000, cols=4)
-        ws.update([SALES_STATE_HEADERS], value_input_option="RAW")
-        return ws
-
-
 # ── СОСТОЯНИЕ В GOOGLE SHEETS ─────────────────────────────────────────────────
 
 @st.cache_data(ttl=STATE_SYNC_TTL)
@@ -426,10 +269,10 @@ def load_state_from_sheets() -> dict[str, Any]:
 
 def save_state_to_sheets() -> None:
     try:
-        in_work = sorted(_safe_str(x) for x in st.session_state.local_in_work if _normalized_str(x))
-        reviewed = sorted(_safe_str(x) for x in st.session_state.reviewed_changes if _normalized_str(x))
+        in_work   = sorted(_safe_str(x) for x in st.session_state.local_in_work if _normalized_str(x))
+        reviewed  = sorted(_safe_str(x) for x in st.session_state.reviewed_changes if _normalized_str(x))
         confirmed = sorted(_safe_str(x) for x in st.session_state.confirmed_cancels if _normalized_str(x))
-        log = [_safe_str(x) for x in st.session_state.completed_log if _normalized_str(x)]
+        log       = [_safe_str(x) for x in st.session_state.completed_log if _normalized_str(x)]
 
         max_len = max(len(in_work), len(reviewed), len(confirmed), len(log), 1)
 
@@ -440,9 +283,12 @@ def save_state_to_sheets() -> None:
         rows += list(map(list, zip(pad(in_work), pad(reviewed), pad(confirmed), pad(log))))
 
         ws = get_state_worksheet()
+
+        # Без clear(): меньше риск гонок и меньше лишних запросов.
         end_row = len(rows)
         ws.update(f"A1:D{end_row}", rows, value_input_option="RAW")
 
+        # Очищаем хвост старых данных, если новый набор короче предыдущего.
         existing_rows = ws.row_count
         if existing_rows > end_row:
             ws.batch_clear([f"A{end_row + 1}:D{existing_rows}"])
@@ -450,94 +296,6 @@ def save_state_to_sheets() -> None:
         load_state_from_sheets.clear()
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
-
-
-# ── СОСТОЯНИЕ ПРОДАЖ В GOOGLE SHEETS ──────────────────────────────────────────
-
-@st.cache_data(ttl=STATE_SYNC_TTL)
-def load_sales_state() -> dict[str, Any]:
-    try:
-        rows = get_sales_state_worksheet().get_all_values()
-        if len(rows) < 2:
-            return {"snapshots": {}, "events": []}
-
-        snapshots: dict[str, dict[str, Any]] = {}
-        events: list[dict[str, Any]] = []
-
-        for row in rows[1:]:
-            row = _ensure_row_width(row, 4)
-            kind = _normalized_str(row[0])
-            key = _normalized_str(row[1])
-            payload_raw = _normalized_str(row[2])
-
-            if not kind or not payload_raw:
-                continue
-
-            try:
-                payload = json.loads(payload_raw)
-            except Exception:
-                continue
-
-            if kind == "SNAPSHOT" and key:
-                snapshots[key] = payload
-            elif kind == "EVENT":
-                events.append(payload)
-
-        return {"snapshots": snapshots, "events": events}
-    except Exception as e:
-        st.warning(f"Не удалось загрузить состояние продаж: {e}")
-        return {"snapshots": {}, "events": []}
-
-
-def save_sales_snapshots(snapshots: dict[str, dict[str, Any]]) -> None:
-    try:
-        ws = get_sales_state_worksheet()
-        state = load_sales_state()
-        existing_events = state["events"]
-
-        rows = [SALES_STATE_HEADERS]
-
-        for key, payload in sorted(snapshots.items(), key=lambda x: x[0]):
-            rows.append([
-                "SNAPSHOT",
-                key,
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                _now().isoformat(timespec="seconds"),
-            ])
-
-        for ev in existing_events:
-            rows.append([
-                "EVENT",
-                _safe_str(ev.get("event_id")),
-                json.dumps(ev, ensure_ascii=False, separators=(",", ":")),
-                _safe_str(ev.get("ts")),
-            ])
-
-        ws.clear()
-        ws.update(f"A1:D{len(rows)}", rows, value_input_option="RAW")
-        load_sales_state.clear()
-    except Exception as e:
-        st.warning(f"Не удалось сохранить снимки продаж: {e}")
-
-
-def append_sales_events(events: list[dict[str, Any]]) -> None:
-    if not events:
-        return
-    try:
-        ws = get_sales_state_worksheet()
-        rows = [
-            [
-                "EVENT",
-                _safe_str(ev.get("event_id")),
-                json.dumps(ev, ensure_ascii=False, separators=(",", ":")),
-                _safe_str(ev.get("ts")),
-            ]
-            for ev in events
-        ]
-        ws.append_rows(rows, value_input_option="RAW")
-        load_sales_state.clear()
-    except Exception as e:
-        st.warning(f"Не удалось сохранить события продаж: {e}")
 
 
 # ── ЗАГРУЗКА ДАННЫХ ЗАКАЗОВ ───────────────────────────────────────────────────
@@ -580,16 +338,16 @@ def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
     try:
         status_idx = headers.index("Статус") if "Статус" in headers else len(headers) - 1
         col_map = {
-            "ORDER": col_idx("Наименование") - 1,
+            "ORDER":   col_idx("Наименование") - 1,
             "PRODUCT": col_idx("Наименование"),
-            "QTY": col_idx("Кол-во"),
-            "WH": col_idx("Склад"),
+            "QTY":     col_idx("Кол-во"),
+            "WH":      col_idx("Склад"),
             "COMMENT": col_idx("Комментарий"),
-            "EDIT": col_idx("Изменения заказа"),
-            "INWORK": col_idx("Под ЗАКАЗ"),
-            "MOVE": col_idx("Перемещение"),
-            "DONE": col_idx("Собрано"),
-            "STATUS": status_idx,
+            "EDIT":    col_idx("Изменения заказа"),
+            "INWORK":  col_idx("Под ЗАКАЗ"),
+            "MOVE":    col_idx("Перемещение"),
+            "DONE":    col_idx("Собрано"),
+            "STATUS":  status_idx,
         }
     except ValueError as e:
         st.error(str(e))
@@ -698,245 +456,6 @@ def _sync_runtime_state() -> None:
     st.session_state.completed_log = list(state["log"])
 
 
-# ── ЛОГИКА СЧЁТЧИКА ПРОДАЖ ────────────────────────────────────────────────────
-
-def build_sales_snapshot(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
-    snapshot: dict[str, dict[str, Any]] = {}
-
-    if df.empty:
-        return snapshot
-
-    tmp = df.copy()
-    tmp["_qty_num"] = tmp[C_QTY].apply(_parse_qty)
-    tmp["_active_qty"] = tmp.apply(
-        lambda r: 0 if _normalized_str(r[C_STATUS]).lower() == CANCELLED_VAL.lower() else _parse_qty(r[C_QTY]),
-        axis=1,
-    )
-
-    grouped = (
-        tmp.groupby([C_ORDER, C_PRODUCT], dropna=False, sort=False)
-        .agg(
-            qty_sum=("_qty_num", "sum"),
-            active_qty_sum=("_active_qty", "sum"),
-            status_last=(C_STATUS, "last"),
-        )
-        .reset_index()
-    )
-
-    for _, row in grouped.iterrows():
-        order_id = _safe_str(row[C_ORDER]).strip()
-        product = _normalize_product_name(row[C_PRODUCT])
-
-        if not order_id or not product:
-            continue
-
-        cls = classify_product(product)
-        key = f"{order_id}||{product}"
-
-        snapshot[key] = {
-            "order_id": order_id,
-            "product": product,
-            "qty": int(row["qty_sum"]),
-            "active_qty": int(row["active_qty_sum"]),
-            "status": _safe_str(row["status_last"]),
-            "section": cls["section"],
-            "category": cls["category"],
-            "model": cls["model"],
-        }
-
-    return snapshot
-
-
-def build_sales_events(
-    prev_snapshots: dict[str, dict[str, Any]],
-    curr_snapshots: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    ts = _now().isoformat(timespec="seconds")
-
-    all_keys = sorted(set(prev_snapshots) | set(curr_snapshots))
-
-    for key in all_keys:
-        prev = prev_snapshots.get(key)
-        curr = curr_snapshots.get(key)
-
-        prev_qty = int(prev.get("active_qty", 0)) if prev else 0
-        curr_qty = int(curr.get("active_qty", 0)) if curr else 0
-        delta = curr_qty - prev_qty
-
-        if delta == 0:
-            continue
-
-        ref = curr or prev
-        reason = "qty_change"
-
-        if prev is None and curr is not None and delta > 0:
-            reason = "new"
-        elif prev is not None and curr is None and delta < 0:
-            reason = "removed"
-        elif prev_qty > 0 and curr_qty == 0:
-            reason = "cancelled_or_zeroed"
-        elif prev_qty == 0 and curr_qty > 0:
-            reason = "restored_or_added"
-
-        events.append({
-            "event_id": f"{ts}|{key}|{delta}",
-            "ts": ts,
-            "snapshot_key": key,
-            "order_id": _safe_str(ref.get("order_id")),
-            "product": _safe_str(ref.get("product")),
-            "section": _safe_str(ref.get("section")),
-            "category": _safe_str(ref.get("category")),
-            "model": _safe_str(ref.get("model")),
-            "delta": int(delta),
-            "reason": reason,
-        })
-
-    return events
-
-
-def sync_sales_counters(df: pd.DataFrame) -> None:
-    sales_state = load_sales_state()
-    prev_snapshots = sales_state["snapshots"]
-    curr_snapshots = build_sales_snapshot(df)
-
-    events = build_sales_events(prev_snapshots, curr_snapshots)
-    if events:
-        append_sales_events(events)
-
-    if curr_snapshots != prev_snapshots:
-        save_sales_snapshots(curr_snapshots)
-
-
-def _events_df() -> pd.DataFrame:
-    state = load_sales_state()
-    events = state.get("events", [])
-    if not events:
-        return pd.DataFrame(columns=["ts", "order_id", "product", "section", "category", "model", "delta", "reason"])
-
-    df = pd.DataFrame(events)
-    if df.empty:
-        return df
-
-    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-    df["delta"] = pd.to_numeric(df["delta"], errors="coerce").fillna(0).astype(int)
-    df = df.dropna(subset=["ts"]).copy()
-    return df
-
-
-def _aggregate_sales(df: pd.DataFrame, group_field: str) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=[group_field, "Плюс", "Минус", "Итого"])
-
-    rows = []
-    for key, group in df.groupby(group_field, dropna=False):
-        plus_val = int(group.loc[group["delta"] > 0, "delta"].sum())
-        minus_val = int(-group.loc[group["delta"] < 0, "delta"].sum())
-        net_val = int(group["delta"].sum())
-        rows.append([key, plus_val, minus_val, net_val])
-
-    result = pd.DataFrame(rows, columns=[group_field, "Плюс", "Минус", "Итого"])
-    result = result.sort_values(["Итого", "Плюс"], ascending=[False, False]).reset_index(drop=True)
-    return result
-
-
-def render_sales_report() -> None:
-    st.title("📊 Отчёты по продажам")
-
-    events = _events_df()
-    if events.empty:
-        st.info("Событий продаж пока нет. Отчёт начнёт накапливаться автоматически.")
-        return
-
-    tab_day, tab_week, tab_month = st.tabs(["День", "Неделя", "Месяц"])
-
-    with tab_day:
-        selected_day = st.date_input("Дата отчёта", value=_now().date(), key="sales_day")
-        day_start = pd.Timestamp(selected_day)
-        day_end = day_start + pd.Timedelta(days=1)
-        day_df = events[(events["ts"] >= day_start) & (events["ts"] < day_end)].copy()
-
-        st.subheader(f"Отчёт за день: {selected_day:%d.%m.%Y}")
-        st.metric("Чистый итог", int(day_df["delta"].sum()) if not day_df.empty else 0)
-
-        dev_df = day_df[day_df["section"] == "devices"]
-        acc_df = day_df[day_df["section"] == "accessories"]
-        other_df = day_df[day_df["section"] == "other"]
-
-        st.markdown("### Устройства по моделям")
-        st.dataframe(_aggregate_sales(dev_df, "model"), use_container_width=True, hide_index=True)
-
-        st.markdown("### Аксессуары")
-        st.dataframe(_aggregate_sales(acc_df, "model"), use_container_width=True, hide_index=True)
-
-        if not other_df.empty:
-            st.markdown("### Прочее")
-            st.dataframe(_aggregate_sales(other_df, "model"), use_container_width=True, hide_index=True)
-
-        st.markdown("### Детализация по позициям")
-        st.dataframe(_aggregate_sales(day_df, "product"), use_container_width=True, hide_index=True)
-
-    with tab_week:
-        selected_week_day = st.date_input("Любая дата нужной недели", value=_now().date(), key="sales_week")
-        selected_ts = pd.Timestamp(selected_week_day)
-        week_start = selected_ts - pd.Timedelta(days=selected_ts.weekday())
-        week_end = week_start + pd.Timedelta(days=7)
-        week_df = events[(events["ts"] >= week_start) & (events["ts"] < week_end)].copy()
-
-        st.subheader(f"Отчёт за неделю: {week_start:%d.%m.%Y} — {(week_end - pd.Timedelta(days=1)):%d.%m.%Y}")
-        st.metric("Чистый итог", int(week_df["delta"].sum()) if not week_df.empty else 0)
-
-        dev_df = week_df[week_df["section"] == "devices"]
-        acc_df = week_df[week_df["section"] == "accessories"]
-        other_df = week_df[week_df["section"] == "other"]
-
-        st.markdown("### Устройства по моделям")
-        st.dataframe(_aggregate_sales(dev_df, "model"), use_container_width=True, hide_index=True)
-
-        st.markdown("### Аксессуары")
-        st.dataframe(_aggregate_sales(acc_df, "model"), use_container_width=True, hide_index=True)
-
-        if not other_df.empty:
-            st.markdown("### Прочее")
-            st.dataframe(_aggregate_sales(other_df, "model"), use_container_width=True, hide_index=True)
-
-        st.markdown("### Детализация по позициям")
-        st.dataframe(_aggregate_sales(week_df, "product"), use_container_width=True, hide_index=True)
-
-    with tab_month:
-        current = _now()
-        default_month = f"{current.year}-{current.month:02d}"
-        month_value = st.text_input("Месяц в формате YYYY-MM", value=default_month, key="sales_month")
-
-        try:
-            month_start = pd.Timestamp(f"{month_value}-01")
-            month_end = month_start + pd.offsets.MonthBegin(1)
-            month_df = events[(events["ts"] >= month_start) & (events["ts"] < month_end)].copy()
-
-            st.subheader(f"Отчёт за месяц: {month_start:%m.%Y}")
-            st.metric("Чистый итог", int(month_df["delta"].sum()) if not month_df.empty else 0)
-
-            dev_df = month_df[month_df["section"] == "devices"]
-            acc_df = month_df[month_df["section"] == "accessories"]
-            other_df = month_df[month_df["section"] == "other"]
-
-            st.markdown("### Устройства по моделям")
-            st.dataframe(_aggregate_sales(dev_df, "model"), use_container_width=True, hide_index=True)
-
-            st.markdown("### Аксессуары")
-            st.dataframe(_aggregate_sales(acc_df, "model"), use_container_width=True, hide_index=True)
-
-            if not other_df.empty:
-                st.markdown("### Прочее")
-                st.dataframe(_aggregate_sales(other_df, "model"), use_container_width=True, hide_index=True)
-
-            st.markdown("### Детализация по позициям")
-            st.dataframe(_aggregate_sales(month_df, "product"), use_container_width=True, hide_index=True)
-
-        except Exception:
-            st.error("Введите месяц в формате YYYY-MM, например 2026-03")
-
-
 # ── АВТООБНОВЛЕНИЕ ────────────────────────────────────────────────────────────
 st.session_state.setdefault("auto_refresh_enabled", True)
 
@@ -969,27 +488,27 @@ if df_mem.empty or not C:
 
 df_mem = df_mem.copy()
 
-C_ORDER = "__order__"
+C_ORDER   = "__order__"
 C_PRODUCT = "__product__"
-C_QTY = "__qty__"
-C_WH = "__wh__"
+C_QTY     = "__qty__"
+C_WH      = "__wh__"
 C_COMMENT = "__comment__"
-C_DONE = "__done__"
-C_MOVE = "__move__"
-C_STATUS = "__status__"
-C_EDIT = "__edit__"
-C_INWORK = "__inwork__"
+C_DONE    = "__done__"
+C_MOVE    = "__move__"
+C_STATUS  = "__status__"
+C_EDIT    = "__edit__"
+C_INWORK  = "__inwork__"
 
-df_mem[C_ORDER] = df_mem.iloc[:, C["ORDER"]].fillna("").astype(str)
+df_mem[C_ORDER]   = df_mem.iloc[:, C["ORDER"]].fillna("").astype(str)
 df_mem[C_PRODUCT] = df_mem.iloc[:, C["PRODUCT"]].fillna("").astype(str)
-df_mem[C_QTY] = df_mem.iloc[:, C["QTY"]].fillna("").astype(str)
-df_mem[C_WH] = df_mem.iloc[:, C["WH"]].fillna("").astype(str)
+df_mem[C_QTY]     = df_mem.iloc[:, C["QTY"]].fillna("").astype(str)
+df_mem[C_WH]      = df_mem.iloc[:, C["WH"]].fillna("").astype(str)
 df_mem[C_COMMENT] = df_mem.iloc[:, C["COMMENT"]].fillna("").astype(str)
-df_mem[C_DONE] = df_mem.iloc[:, C["DONE"]].fillna("").astype(str)
-df_mem[C_MOVE] = df_mem.iloc[:, C["MOVE"]].fillna("").astype(str)
-df_mem[C_STATUS] = df_mem.iloc[:, C["STATUS"]].fillna("").astype(str)
-df_mem[C_EDIT] = df_mem.iloc[:, C["EDIT"]].fillna("").astype(str)
-df_mem[C_INWORK] = df_mem.iloc[:, C["INWORK"]].fillna("").astype(str)
+df_mem[C_DONE]    = df_mem.iloc[:, C["DONE"]].fillna("").astype(str)
+df_mem[C_MOVE]    = df_mem.iloc[:, C["MOVE"]].fillna("").astype(str)
+df_mem[C_STATUS]  = df_mem.iloc[:, C["STATUS"]].fillna("").astype(str)
+df_mem[C_EDIT]    = df_mem.iloc[:, C["EDIT"]].fillna("").astype(str)
+df_mem[C_INWORK]  = df_mem.iloc[:, C["INWORK"]].fillna("").astype(str)
 
 TABLE_COLS = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT]
 COL_RENAME = {
@@ -1016,9 +535,6 @@ work_base["_is_cancelled"] = (
     work_base[C_STATUS].astype(str).str.strip().str.lower() == CANCELLED_VAL.lower()
 )
 
-# Синхронизация счётчика продаж
-sync_sales_counters(work_base)
-
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
 
@@ -1041,7 +557,6 @@ st.sidebar.caption(f"🔄 Последняя синхронизация: **{st.s
 if st.sidebar.button("🔃 Обновить данные сейчас"):
     load_data.clear()
     load_state_from_sheets.clear()
-    load_sales_state.clear()
     st.rerun()
 
 # ── ЛОГИКА МАГАЗИНА ───────────────────────────────────────────────────────────
@@ -1307,6 +822,3 @@ elif menu == "🚫 Отмененные заказы":
             use_container_width=True,
             hide_index=True,
         )
-
-elif menu == "📊 Отчёты по продажам":
-    render_sales_report()
