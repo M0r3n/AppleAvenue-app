@@ -36,6 +36,8 @@ STORE_PEKIN     = "Пекин"
 STORE_TIK       = "ТИК"
 CANCELLED_VAL   = "Отменён"
 STATE_SYNC_TTL  = 15
+REPORT_PAGE_KEY = "report_page_open"
+REPORT_DATE_COL = "Дата и время сбора заказа"
 
 _PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
 _GORB_KEYWORDS  = ("горб", "грб", "gorb")
@@ -456,6 +458,115 @@ def _sync_runtime_state() -> None:
     st.session_state.completed_log = list(state["log"])
 
 
+def _to_numeric_qty(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype(str)
+        .str.replace("\xa0", "", regex=False)
+        .str.replace(" ", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0)
+
+
+def _prepare_sales_report_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Для отчёта берём только собранные и не отменённые позиции.
+    Дата продажи = 'Дата и время сбора заказа'.
+    """
+    if REPORT_DATE_COL not in df.columns:
+        return pd.DataFrame()
+
+    report_df = df.copy()
+    report_df["_qty_num"] = _to_numeric_qty(report_df[C_QTY])
+    report_df["_dt"] = pd.to_datetime(
+        report_df[REPORT_DATE_COL].fillna("").astype(str).str.strip(),
+        errors="coerce",
+        dayfirst=True,
+    )
+
+    report_df = report_df[
+        (report_df[C_DONE] == TRUE_VAL)
+        & ~report_df["_is_cancelled"]
+        & report_df["_dt"].notna()
+        & report_df[C_PRODUCT].fillna("").astype(str).str.strip().astype(bool)
+    ].copy()
+
+    return report_df
+
+
+def _build_period_report(report_df: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
+    period_df = report_df[
+        (report_df["_dt"] >= start_dt)
+        & (report_df["_dt"] < end_dt)
+    ].copy()
+
+    if period_df.empty:
+        return pd.DataFrame(columns=["Товар", "Продано"])
+
+    result = (
+        period_df.groupby(C_PRODUCT, dropna=False)["_qty_num"]
+        .sum()
+        .reset_index()
+        .rename(columns={C_PRODUCT: "Товар", "_qty_num": "Продано"})
+        .sort_values(["Продано", "Товар"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+
+    result["Продано"] = result["Продано"].apply(
+        lambda x: int(x) if float(x).is_integer() else round(float(x), 3)
+    )
+    return result
+
+
+def render_report() -> None:
+    st.title("📊 Отчёт по продажам")
+
+    report_df = _prepare_sales_report_df(work_base)
+
+    if REPORT_DATE_COL not in work_base.columns:
+        st.warning(f"В таблице не найден столбец «{REPORT_DATE_COL}».")
+        return
+
+    st.caption(f"Отчёт строится по столбцу: **{REPORT_DATE_COL}**")
+
+    now_ts = pd.Timestamp(_now())
+    today_start = now_ts.normalize()
+    tomorrow_start = today_start + pd.Timedelta(days=1)
+
+    week_start = today_start - pd.Timedelta(days=today_start.weekday())
+    next_week_start = week_start + pd.Timedelta(days=7)
+
+    month_start = today_start.replace(day=1)
+    next_month_start = month_start + pd.offsets.MonthBegin(1)
+
+    day_report = _build_period_report(report_df, today_start, tomorrow_start)
+    week_report = _build_period_report(report_df, week_start, next_week_start)
+    month_report = _build_period_report(report_df, month_start, next_month_start)
+
+    tabs = st.tabs(["За день", "За неделю", "За месяц"])
+
+    with tabs[0]:
+        st.subheader("Продано за сегодня")
+        if day_report.empty:
+            st.info("За сегодня продаж нет.")
+        else:
+            st.dataframe(day_report, use_container_width=True, hide_index=True)
+
+    with tabs[1]:
+        st.subheader("Продано за текущую неделю")
+        if week_report.empty:
+            st.info("За текущую неделю продаж нет.")
+        else:
+            st.dataframe(week_report, use_container_width=True, hide_index=True)
+
+    with tabs[2]:
+        st.subheader("Продано за текущий месяц")
+        if month_report.empty:
+            st.info("За текущий месяц продаж нет.")
+        else:
+            st.dataframe(month_report, use_container_width=True, hide_index=True)
+
+
 # ── АВТООБНОВЛЕНИЕ ────────────────────────────────────────────────────────────
 st.session_state.setdefault("auto_refresh_enabled", True)
 
@@ -472,6 +583,7 @@ if "session_initialized" not in st.session_state:
     st.session_state.new_orders_alert = set()
     st.session_state.new_orders_alert_time = None
     st.session_state.last_sync = "Не обновлялось"
+    st.session_state[REPORT_PAGE_KEY] = False
     st.session_state.session_initialized = True
 else:
     _sync_runtime_state()
@@ -557,6 +669,11 @@ st.sidebar.caption(f"🔄 Последняя синхронизация: **{st.s
 if st.sidebar.button("🔃 Обновить данные сейчас"):
     load_data.clear()
     load_state_from_sheets.clear()
+    st.rerun()
+
+st.sidebar.markdown("---")
+if st.sidebar.button("📊 Отчёт", use_container_width=True):
+    st.session_state[REPORT_PAGE_KEY] = True
     st.rerun()
 
 # ── ЛОГИКА МАГАЗИНА ───────────────────────────────────────────────────────────
@@ -770,7 +887,13 @@ def render_store(current_store: str) -> None:
 
 # ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
 
-if "Магазин" in menu:
+if st.session_state.get(REPORT_PAGE_KEY):
+    render_report()
+    if st.sidebar.button("⬅️ Назад", use_container_width=True):
+        st.session_state[REPORT_PAGE_KEY] = False
+        st.rerun()
+
+elif "Магазин" in menu:
     render_store(STORE_GORB if "ГОРБУШКА" in menu else STORE_PEKIN)
 
 elif menu == "🚚 Перемещения (Активные)":
