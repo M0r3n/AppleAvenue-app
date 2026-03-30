@@ -1,7 +1,14 @@
 """
 Авеню: Система Заказов
-v4.4 — безопасный рефакторинг без изменения UI/логики.
-Сверх-осторожная версия: точечные обновления только нужных ячеек, время записи по МСК без авто-конвертации Google Sheets.
+v4.5 — безопасный рефакторинг без изменения UI/логики.
+
+Что улучшено:
+- код структурирован по блокам;
+- убраны повторы;
+- добавлены более безопасные helper-функции;
+- обновления в Google Sheets по-прежнему точечные;
+- время записи по МСК сохраняется строкой без авто-конвертации Sheets;
+- сохранён текущий UI, сценарии и бизнес-логика.
 """
 
 from __future__ import annotations
@@ -12,7 +19,7 @@ import hmac
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import extra_streamlit_components as stx
@@ -24,35 +31,35 @@ from streamlit_autorefresh import st_autorefresh
 
 
 # ── КОНСТАНТЫ ─────────────────────────────────────────────────────────────────
-SHEET_ID                = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
-TAB_NAME                = "Заказы ИМ Авеню"
-STATE_TAB_NAME          = "avenue_state"
+SHEET_ID = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
+TAB_NAME = "Заказы ИМ Авеню"
+STATE_TAB_NAME = "avenue_state"
 
-PZ_LIST                 = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
-START_ROW               = 26596
+PZ_LIST = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
+START_ROW = 26596
 
-TRUE_VAL                = "TRUE"
-FALSE_VAL               = "FALSE"
-CANCELLED_VAL           = "Отменён"
+TRUE_VAL = "TRUE"
+FALSE_VAL = "FALSE"
+CANCELLED_VAL = "Отменён"
 
-COOKIE_NAME             = "avenue_auth_status"
-COOKIE_DAYS             = 30
+COOKIE_NAME = "avenue_auth_status"
+COOKIE_DAYS = 30
 
-REFRESH_MS              = 600_000
-PREVIEW_ORDERS          = 50
-STATE_SYNC_TTL          = 15
+REFRESH_MS = 600_000
+PREVIEW_ORDERS = 50
+STATE_SYNC_TTL = 15
 
-REPORT_PAGE_KEY         = "report_page_open"
-REPORT_DATE_COL         = "Дата и время сбора заказа"
+REPORT_PAGE_KEY = "report_page_open"
+REPORT_DATE_COL = "Дата и время сбора заказа"
 
-STORE_GORB              = "Горбушка"
-STORE_PEKIN             = "Пекин"
-STORE_TIK               = "ТИК"
+STORE_GORB = "Горбушка"
+STORE_PEKIN = "Пекин"
+STORE_TIK = "ТИК"
 
-MSK_TZ                  = ZoneInfo("Europe/Moscow")
+MSK_TZ = ZoneInfo("Europe/Moscow")
 
 _PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
-_GORB_KEYWORDS  = ("горб", "грб", "gorb")
+_GORB_KEYWORDS = ("горб", "грб", "gorb")
 
 MENU_OPTIONS = [
     "🏪 Магазин: ГОРБУШКА",
@@ -101,7 +108,7 @@ class ColumnMap:
         }
 
 
-# ── УТИЛИТЫ ───────────────────────────────────────────────────────────────────
+# ── БАЗОВЫЕ УТИЛИТЫ ───────────────────────────────────────────────────────────
 def _now() -> datetime:
     return datetime.now(MSK_TZ)
 
@@ -111,23 +118,11 @@ def _sheet_datetime_now() -> str:
 
 
 def _safe_str(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value)
+    return "" if value is None else str(value)
 
 
 def _normalized_str(value: Any) -> str:
     return _safe_str(value).strip()
-
-
-def _get_secret(name: str, default: str | None = None) -> str:
-    try:
-        return str(st.secrets[name])
-    except Exception:
-        if default is not None:
-            return default
-        st.error(f"Критическая ошибка: отсутствует secret «{name}».")
-        st.stop()
 
 
 def _ensure_row_width(row: list[str], width: int) -> list[str]:
@@ -149,7 +144,25 @@ def _review_key(oid: Any, edit_text: str) -> str:
     return f"{_safe_str(oid)}||{_normalized_str(edit_text)}"
 
 
-# ── АВТОРИЗАЦИЯ ───────────────────────────────────────────────────────────────
+def _get_secret(name: str, default: str | None = None) -> str:
+    try:
+        return str(st.secrets[name])
+    except Exception:
+        if default is not None:
+            return default
+        st.error(f"Критическая ошибка: отсутствует secret «{name}».")
+        st.stop()
+
+
+def _bool_series_eq(series: pd.Series, expected: str) -> pd.Series:
+    return series.fillna("").astype(str) == expected
+
+
+def _safe_unique_str_set(series: pd.Series) -> set[str]:
+    return set(series.dropna().astype(str).unique())
+
+
+# ── COOKIE / АВТОРИЗАЦИЯ ──────────────────────────────────────────────────────
 def _cookie_signing_key() -> str:
     raw = _get_secret("password")
     pepper = _get_secret("cookie_sign_salt", "avenue_cookie_default_salt")
@@ -161,6 +174,7 @@ def _make_signed_cookie() -> str:
     payload = {"exp": expires_at, "v": "authorized"}
     payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     payload_b64 = base64.urlsafe_b64encode(payload_json.encode("utf-8")).decode("utf-8")
+
     sig = hmac.new(
         _cookie_signing_key().encode("utf-8"),
         payload_b64.encode("utf-8"),
@@ -172,6 +186,7 @@ def _make_signed_cookie() -> str:
 def _verify_signed_cookie(token: str | None) -> bool:
     if not token or "." not in str(token):
         return False
+
     try:
         payload_b64, sig = str(token).rsplit(".", 1)
         expected_sig = hmac.new(
@@ -179,15 +194,18 @@ def _verify_signed_cookie(token: str | None) -> bool:
             payload_b64.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+
         if not hmac.compare_digest(sig, expected_sig):
             return False
 
         payload_json = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
         payload = json.loads(payload_json)
+
         if payload.get("v") != "authorized":
             return False
         if int(payload.get("exp", 0)) < int(_now().timestamp()):
             return False
+
         return True
     except Exception:
         return False
@@ -230,6 +248,7 @@ def check_password() -> bool:
             st.rerun()
         else:
             st.error("❌ Неверный код")
+
     return False
 
 
@@ -237,7 +256,7 @@ if not check_password():
     st.stop()
 
 
-# ── GOOGLE SHEETS: РЕСУРСЫ ────────────────────────────────────────────────────
+# ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_gspread_client() -> gspread.Client:
     try:
@@ -296,23 +315,25 @@ def get_state_worksheet() -> gspread.Worksheet:
         return ws
 
 
-# ── СОСТОЯНИЕ В GOOGLE SHEETS ─────────────────────────────────────────────────
+# ── STATE В SHEETS ────────────────────────────────────────────────────────────
+def _empty_state() -> dict[str, Any]:
+    return {
+        "in_work": set(),
+        "reviewed": set(),
+        "confirmed": set(),
+        "log": [],
+    }
+
+
 @st.cache_data(ttl=STATE_SYNC_TTL)
 def load_state_from_sheets() -> dict[str, Any]:
     try:
         rows = get_state_worksheet().get_all_values()
         if len(rows) < 2:
-            return {"in_work": set(), "reviewed": set(), "confirmed": set(), "log": []}
+            return _empty_state()
 
-        data = rows[1:]
-        result = {
-            "in_work": set(),
-            "reviewed": set(),
-            "confirmed": set(),
-            "log": [],
-        }
-
-        for row in data:
+        result = _empty_state()
+        for row in rows[1:]:
             row = _ensure_row_width(row, 4)
             if _normalized_str(row[0]):
                 result["in_work"].add(_normalized_str(row[0]))
@@ -322,19 +343,19 @@ def load_state_from_sheets() -> dict[str, Any]:
                 result["confirmed"].add(_normalized_str(row[2]))
             if _normalized_str(row[3]):
                 result["log"].append(_normalized_str(row[3]))
-
         return result
+
     except Exception as e:
         st.warning(f"Не удалось загрузить состояние из Sheets: {e}")
-        return {"in_work": set(), "reviewed": set(), "confirmed": set(), "log": []}
+        return _empty_state()
 
 
 def save_state_to_sheets() -> None:
     try:
-        in_work   = sorted(_safe_str(x) for x in st.session_state.local_in_work if _normalized_str(x))
-        reviewed  = sorted(_safe_str(x) for x in st.session_state.reviewed_changes if _normalized_str(x))
+        in_work = sorted(_safe_str(x) for x in st.session_state.local_in_work if _normalized_str(x))
+        reviewed = sorted(_safe_str(x) for x in st.session_state.reviewed_changes if _normalized_str(x))
         confirmed = sorted(_safe_str(x) for x in st.session_state.confirmed_cancels if _normalized_str(x))
-        log       = [_safe_str(x) for x in st.session_state.completed_log if _normalized_str(x)]
+        log = [_safe_str(x) for x in st.session_state.completed_log if _normalized_str(x)]
 
         max_len = max(len(in_work), len(reviewed), len(confirmed), len(log), 1)
 
@@ -354,6 +375,7 @@ def save_state_to_sheets() -> None:
             ws.batch_clear([f"A{end_row + 1}:D{existing_rows}"])
 
         load_state_from_sheets.clear()
+
     except Exception as e:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
 
@@ -366,11 +388,12 @@ def _sync_runtime_state() -> None:
     st.session_state.completed_log = list(state["log"])
 
 
-# ── ЗАГРУЗКА ДАННЫХ ЗАКАЗОВ ───────────────────────────────────────────────────
+# ── ЗАГРУЗКА ДАННЫХ ───────────────────────────────────────────────────────────
 def _find_header_row(raw_data: list[list[str]]) -> int:
     return next(
         (
-            i for i, row in enumerate(raw_data[:100])
+            i
+            for i, row in enumerate(raw_data[:100])
             if "Наименование" in row and "Склад" in row
         ),
         -1,
@@ -408,13 +431,8 @@ def _build_column_map(headers: list[str]) -> ColumnMap:
 
 @st.cache_data(ttl=3600)
 def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
-    """
-    Загружает данные из листа заказов.
-    Интерфейс и бизнес-логика сохранены как были.
-    """
     try:
-        sheet = get_orders_worksheet()
-        raw_data = sheet.get_all_values()
+        raw_data = get_orders_worksheet().get_all_values()
     except Exception as e:
         st.error(f"Ошибка чтения листа заказов: {e}")
         return pd.DataFrame(), {}
@@ -453,19 +471,19 @@ def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
 
 # ── ТОЧЕЧНЫЕ ОБНОВЛЕНИЯ В SHEETS ──────────────────────────────────────────────
 def _build_batch_payload_for_rows(
-    row_numbers: list[int],
+    row_numbers: Iterable[int],
     col_num_0based: int,
     value: str,
 ) -> list[dict[str, Any]]:
     col_letter = _a1_col(col_num_0based + 1)
-    return [{"range": f"{col_letter}{row_num}", "values": [[value]]} for row_num in row_numbers]
+    return [{"range": f"{col_letter}{int(row_num)}", "values": [[value]]} for row_num in row_numbers]
+
+
+def _clear_data_cache_after_update() -> None:
+    load_data.clear()
 
 
 def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: dict[str, str]) -> None:
-    """
-    Аккуратно обновляет только целевые ячейки.
-    Не трогает другие диапазоны.
-    """
     try:
         sheet = get_orders_worksheet()
         row_numbers = [int(x) for x in group["_sheet_row"].tolist()]
@@ -474,39 +492,32 @@ def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: di
         for key, val in updates.items():
             if key not in col_map:
                 raise KeyError(f"Неизвестный ключ обновления: {key}")
-
-            col_num_0based = int(col_map[key])
-            batch_payload.extend(_build_batch_payload_for_rows(row_numbers, col_num_0based, val))
+            batch_payload.extend(_build_batch_payload_for_rows(row_numbers, int(col_map[key]), val))
 
         if batch_payload:
             sheet.batch_update(batch_payload, value_input_option="RAW")
-            load_data.clear()
+            _clear_data_cache_after_update()
 
     except Exception as e:
         st.warning(f"Не удалось обновить данные в Sheets: {e}")
 
 
 def write_report_datetime(group: pd.DataFrame, col_map: dict[str, int], dt_value: str) -> None:
-    """
-    Записывает дату/время строго в найденную по заголовку колонку отчёта.
-    Время всегда по МСК и сохраняется БЕЗ авто-конвертации Google Sheets.
-    """
     try:
         sheet = get_orders_worksheet()
         row_numbers = [int(x) for x in group["_sheet_row"].tolist()]
         report_col = int(col_map["REPORT_DT"])
 
         batch_payload = _build_batch_payload_for_rows(row_numbers, report_col, dt_value)
-
         if batch_payload:
             sheet.batch_update(batch_payload, value_input_option="RAW")
-            load_data.clear()
+            _clear_data_cache_after_update()
 
     except Exception as e:
         st.warning(f"Не удалось записать дату сборки: {e}")
 
 
-# ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
+# ── ПРЕДМЕТНАЯ ЛОГИКА ─────────────────────────────────────────────────────────
 def identify_target_store(comment: str) -> str:
     c = _safe_str(comment).lower()
     if "d" in c:
@@ -533,6 +544,7 @@ def _build_tags(
     is_tik_pending: bool = False,
 ) -> str:
     tags: list[str] = []
+
     if is_cancelled:
         tags.append("🚫 ОТМЕНА")
     if is_delivery(comment_str):
@@ -547,6 +559,7 @@ def _build_tags(
         tags.append("⏳ ПЗ")
     if incoming:
         tags.append("🚚 ЕДЕТ")
+
     return " | ".join(tags)
 
 
@@ -572,10 +585,6 @@ def _to_numeric_qty(series: pd.Series) -> pd.Series:
 
 
 def _prepare_sales_report_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Для отчёта берём только собранные и не отменённые позиции.
-    Дата продажи = 'Дата и время сбора заказа'.
-    """
     if REPORT_DATE_COL not in df.columns:
         return pd.DataFrame()
 
@@ -598,10 +607,7 @@ def _prepare_sales_report_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_period_report(report_df: pd.DataFrame, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
-    period_df = report_df[
-        (report_df["_dt"] >= start_dt)
-        & (report_df["_dt"] < end_dt)
-    ].copy()
+    period_df = report_df[(report_df["_dt"] >= start_dt) & (report_df["_dt"] < end_dt)].copy()
 
     if period_df.empty:
         return pd.DataFrame(columns=["Товар", "Продано"])
@@ -680,23 +686,27 @@ refresh_count = (
 )
 
 
-# ── ИНИЦИАЛИЗАЦИЯ СЕССИИ ──────────────────────────────────────────────────────
-if "session_initialized" not in st.session_state:
-    _sync_runtime_state()
-    st.session_state.prev_order_ids = set()
-    st.session_state.new_orders_alert = set()
-    st.session_state.new_orders_alert_time = None
-    st.session_state.last_sync = "Не обновлялось"
-    st.session_state[REPORT_PAGE_KEY] = False
-    st.session_state.session_initialized = True
-else:
-    _sync_runtime_state()
+# ── ИНИЦИАЛИЗАЦИЯ SESSION_STATE ───────────────────────────────────────────────
+def _init_session_state() -> None:
+    if "session_initialized" not in st.session_state:
+        _sync_runtime_state()
+        st.session_state.prev_order_ids = set()
+        st.session_state.new_orders_alert = set()
+        st.session_state.new_orders_alert_time = None
+        st.session_state.last_sync = "Не обновлялось"
+        st.session_state[REPORT_PAGE_KEY] = False
+        st.session_state.session_initialized = True
+    else:
+        _sync_runtime_state()
+
+
+_init_session_state()
 
 if refresh_count > 0:
     load_data.clear()
 
 
-# ── ЗАГРУЗКА И ПОДГОТОВКА ДАННЫХ ──────────────────────────────────────────────
+# ── ПОДГОТОВКА DF ─────────────────────────────────────────────────────────────
 df_mem, C = load_data()
 
 if df_mem.empty or not C:
@@ -705,27 +715,27 @@ if df_mem.empty or not C:
 
 df_mem = df_mem.copy()
 
-C_ORDER   = "__order__"
+C_ORDER = "__order__"
 C_PRODUCT = "__product__"
-C_QTY     = "__qty__"
-C_WH      = "__wh__"
+C_QTY = "__qty__"
+C_WH = "__wh__"
 C_COMMENT = "__comment__"
-C_DONE    = "__done__"
-C_MOVE    = "__move__"
-C_STATUS  = "__status__"
-C_EDIT    = "__edit__"
-C_INWORK  = "__inwork__"
+C_DONE = "__done__"
+C_MOVE = "__move__"
+C_STATUS = "__status__"
+C_EDIT = "__edit__"
+C_INWORK = "__inwork__"
 
-df_mem[C_ORDER]   = df_mem.iloc[:, C["ORDER"]].fillna("").astype(str)
+df_mem[C_ORDER] = df_mem.iloc[:, C["ORDER"]].fillna("").astype(str)
 df_mem[C_PRODUCT] = df_mem.iloc[:, C["PRODUCT"]].fillna("").astype(str)
-df_mem[C_QTY]     = df_mem.iloc[:, C["QTY"]].fillna("").astype(str)
-df_mem[C_WH]      = df_mem.iloc[:, C["WH"]].fillna("").astype(str)
+df_mem[C_QTY] = df_mem.iloc[:, C["QTY"]].fillna("").astype(str)
+df_mem[C_WH] = df_mem.iloc[:, C["WH"]].fillna("").astype(str)
 df_mem[C_COMMENT] = df_mem.iloc[:, C["COMMENT"]].fillna("").astype(str)
-df_mem[C_DONE]    = df_mem.iloc[:, C["DONE"]].fillna("").astype(str)
-df_mem[C_MOVE]    = df_mem.iloc[:, C["MOVE"]].fillna("").astype(str)
-df_mem[C_STATUS]  = df_mem.iloc[:, C["STATUS"]].fillna("").astype(str)
-df_mem[C_EDIT]    = df_mem.iloc[:, C["EDIT"]].fillna("").astype(str)
-df_mem[C_INWORK]  = df_mem.iloc[:, C["INWORK"]].fillna("").astype(str)
+df_mem[C_DONE] = df_mem.iloc[:, C["DONE"]].fillna("").astype(str)
+df_mem[C_MOVE] = df_mem.iloc[:, C["MOVE"]].fillna("").astype(str)
+df_mem[C_STATUS] = df_mem.iloc[:, C["STATUS"]].fillna("").astype(str)
+df_mem[C_EDIT] = df_mem.iloc[:, C["EDIT"]].fillna("").astype(str)
+df_mem[C_INWORK] = df_mem.iloc[:, C["INWORK"]].fillna("").astype(str)
 
 TABLE_COLS = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT]
 COL_RENAME = {
@@ -736,7 +746,7 @@ COL_RENAME = {
     C_COMMENT: "Коммент",
 }
 
-current_order_ids = set(df_mem[C_ORDER].dropna().astype(str).unique())
+current_order_ids = _safe_unique_str_set(df_mem[C_ORDER])
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
     if new_ids:
@@ -751,37 +761,43 @@ work_base["_is_cancelled"] = (
 )
 
 
-# ── САЙДБАР ───────────────────────────────────────────────────────────────────
-st.sidebar.title("🏢 Меню Авеню")
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+def render_sidebar() -> str:
+    st.sidebar.title("🏢 Меню Авеню")
 
-st.session_state.auto_refresh_enabled = st.sidebar.toggle(
-    "🔄 Автообновление (10 мин)",
-    value=st.session_state.auto_refresh_enabled,
-    key="auto_refresh_toggle",
-)
+    st.session_state.auto_refresh_enabled = st.sidebar.toggle(
+        "🔄 Автообновление (10 мин)",
+        value=st.session_state.auto_refresh_enabled,
+        key="auto_refresh_toggle",
+    )
 
-menu = st.sidebar.selectbox("Выберите раздел:", MENU_OPTIONS)
+    menu_value = st.sidebar.selectbox("Выберите раздел:", MENU_OPTIONS)
 
-if st.sidebar.button("🚪 Выйти"):
-    cookie_manager.delete(COOKIE_NAME)
-    st.session_state.password_correct = False
-    st.rerun()
+    if st.sidebar.button("🚪 Выйти"):
+        cookie_manager.delete(COOKIE_NAME)
+        st.session_state.password_correct = False
+        st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.caption(f"🔄 Последняя синхронизация: **{st.session_state.last_sync}**")
+    st.sidebar.markdown("---")
+    st.sidebar.caption(f"🔄 Последняя синхронизация: **{st.session_state.last_sync}**")
 
-if st.sidebar.button("🔃 Обновить данные сейчас"):
-    load_data.clear()
-    load_state_from_sheets.clear()
-    st.rerun()
+    if st.sidebar.button("🔃 Обновить данные сейчас"):
+        load_data.clear()
+        load_state_from_sheets.clear()
+        st.rerun()
 
-st.sidebar.markdown("---")
-if st.sidebar.button("📊 Отчёт", use_container_width=True):
-    st.session_state[REPORT_PAGE_KEY] = True
-    st.rerun()
+    st.sidebar.markdown("---")
+    if st.sidebar.button("📊 Отчёт", use_container_width=True):
+        st.session_state[REPORT_PAGE_KEY] = True
+        st.rerun()
+
+    return menu_value
 
 
-# ── ЛОГИКА МАГАЗИНА ───────────────────────────────────────────────────────────
+menu = render_sidebar()
+
+
+# ── STORE VIEW ────────────────────────────────────────────────────────────────
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
 
@@ -800,14 +816,11 @@ def render_store(current_store: str) -> None:
         st.success(f"🆕 Новые заказы: {', '.join(sorted(str(o) for o in store_new_alert))}")
 
     is_pz_row = work_base[C_WH].isin(PZ_LIST)
-    is_move = work_base[C_MOVE] == TRUE_VAL
+    is_move = _bool_series_eq(work_base[C_MOVE], TRUE_VAL)
     wh_match = work_base[C_WH].str.contains(wh_pattern, case=False, na=False)
 
     is_f_match = wh_match & ~is_pz_row
-    is_pz_match = (
-        (work_base[C_WH] == f"ПЗ {current_store}")
-        & (work_base[C_INWORK] == TRUE_VAL)
-    )
+    is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & _bool_series_eq(work_base[C_INWORK], TRUE_VAL)
     is_incoming = is_move & (work_base["_target_store"] == current_store)
     is_tik_pending = (
         (work_base[C_WH].str.strip() == STORE_TIK)
@@ -841,12 +854,57 @@ def render_store(current_store: str) -> None:
     )
 
     display_df = work_base[
-        (base_mask & ((work_base[C_DONE] != TRUE_VAL) | has_unrev) & not_confirmed_cancelled)
+        (base_mask & ((_bool_series_eq(work_base[C_DONE], TRUE_VAL) == False) | has_unrev) & not_confirmed_cancelled)
         | is_cancelled_unconfirmed
     ].copy()
     display_df["_is_tik_pending"] = is_tik_pending.reindex(display_df.index, fill_value=False)
 
     in_work_ids = {str(x) for x in st.session_state.local_in_work}
+
+    def _handle_mark_in_work(oid_str: str) -> None:
+        st.session_state.local_in_work.add(oid_str)
+        save_state_to_sheets()
+        st.rerun()
+
+    def _handle_review_change(review_key: str) -> None:
+        st.session_state.reviewed_changes.add(review_key)
+        save_state_to_sheets()
+        st.rerun()
+
+    def _handle_confirm_cancel(oid_str: str, group: pd.DataFrame) -> None:
+        update_sheet_cells(group, C, {"DONE": TRUE_VAL})
+        st.session_state.confirmed_cancels.add(oid_str)
+        st.session_state.local_in_work.discard(oid_str)
+        _log_action(oid_str, group, current_store, "cancel_confirmed")
+        save_state_to_sheets()
+        st.rerun()
+
+    def _handle_send_move(oid_str: str, group: pd.DataFrame) -> None:
+        update_sheet_cells(group, C, {"MOVE": TRUE_VAL})
+        st.session_state.local_in_work.discard(oid_str)
+        save_state_to_sheets()
+        st.rerun()
+
+    def _handle_complete_order(oid_str: str, group: pd.DataFrame, review_key: str | None = None) -> None:
+        dt_now = _sheet_datetime_now()
+        update_sheet_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
+        write_report_datetime(group, C, dt_now)
+        st.session_state.local_in_work.discard(oid_str)
+        if review_key:
+            st.session_state.reviewed_changes.discard(review_key)
+        _log_action(oid_str, group, current_store, "done")
+        save_state_to_sheets()
+        st.rerun()
+
+    def _handle_cancel_order(oid_str: str, group: pd.DataFrame) -> None:
+        update_sheet_cells(group, C, {"STATUS": CANCELLED_VAL})
+        st.session_state.local_in_work.discard(oid_str)
+        save_state_to_sheets()
+        st.rerun()
+
+    def _handle_tik_move(group: pd.DataFrame) -> None:
+        update_sheet_cells(group, C, {"MOVE": TRUE_VAL})
+        st.rerun()
 
     def _render_order(oid: Any, group: pd.DataFrame, in_work_section: bool) -> None:
         oid_str = _safe_str(oid)
@@ -855,8 +913,8 @@ def render_store(current_store: str) -> None:
         incoming = _safe_str(group[C_MOVE].iloc[0]) == TRUE_VAL
         is_pz_item = group[C_WH].isin(PZ_LIST).any() and (group[C_INWORK] == TRUE_VAL).any()
         edit_text = _safe_str(group[C_EDIT].iloc[0])
-        rk = _review_key(oid_str, edit_text)
-        has_edit = bool(edit_text.strip()) and rk not in reviewed
+        review_key = _review_key(oid_str, edit_text)
+        has_edit = bool(edit_text.strip()) and review_key not in reviewed
         is_move_needed = target != current_store and target != "Общий" and not incoming
         cancelled = bool(group["_is_cancelled"].iloc[0])
         tik_pending = bool(group["_is_tik_pending"].iloc[0])
@@ -891,19 +949,12 @@ def render_store(current_store: str) -> None:
                     type="primary",
                     use_container_width=True,
                 ):
-                    update_sheet_cells(group, C, {"DONE": TRUE_VAL})
-                    st.session_state.confirmed_cancels.add(oid_str)
-                    st.session_state.local_in_work.discard(oid_str)
-                    _log_action(oid_str, group, current_store, "cancel_confirmed")
-                    save_state_to_sheets()
-                    st.rerun()
+                    _handle_confirm_cancel(oid_str, group)
 
             elif has_edit:
                 btn = "Учесть правку" if in_work_section else "Учесть Изменение"
                 if st.button(btn, key=f"rev_{'w' if in_work_section else 'n'}_{oid_str}"):
-                    st.session_state.reviewed_changes.add(rk)
-                    save_state_to_sheets()
-                    st.rerun()
+                    _handle_review_change(review_key)
 
             elif tik_pending:
                 if st.button(
@@ -912,15 +963,12 @@ def render_store(current_store: str) -> None:
                     type="primary",
                     use_container_width=True,
                 ):
-                    update_sheet_cells(group, C, {"MOVE": TRUE_VAL})
-                    st.rerun()
+                    _handle_tik_move(group)
 
                 st.markdown("---")
                 if not in_work_section:
                     if st.button("В работу", key=f"w_{oid_str}", use_container_width=True):
-                        st.session_state.local_in_work.add(oid_str)
-                        save_state_to_sheets()
-                        st.rerun()
+                        _handle_mark_in_work(oid_str)
                 else:
                     if st.button(
                         "✅ ПРИНЯТО И СОБРАНО",
@@ -928,20 +976,7 @@ def render_store(current_store: str) -> None:
                         type="primary",
                         use_container_width=True,
                     ):
-                        dt_now = _sheet_datetime_now()
-                        update_sheet_cells(
-                            group,
-                            C,
-                            {
-                                "DONE": TRUE_VAL,
-                                "MOVE": FALSE_VAL,
-                            },
-                        )
-                        write_report_datetime(group, C, dt_now)
-                        st.session_state.local_in_work.discard(oid_str)
-                        _log_action(oid_str, group, current_store, "done")
-                        save_state_to_sheets()
-                        st.rerun()
+                        _handle_complete_order(oid_str, group)
 
             elif in_work_section:
                 if is_move_needed:
@@ -951,10 +986,7 @@ def render_store(current_store: str) -> None:
                         type="primary",
                         use_container_width=True,
                     ):
-                        update_sheet_cells(group, C, {"MOVE": TRUE_VAL})
-                        st.session_state.local_in_work.discard(oid_str)
-                        save_state_to_sheets()
-                        st.rerun()
+                        _handle_send_move(oid_str, group)
                 else:
                     action_label = "✅ ПРИНЯТО И СОБРАНО" if incoming else "✅ ЗАВЕРШИТЬ СБОРКУ"
                     if st.button(
@@ -963,34 +995,15 @@ def render_store(current_store: str) -> None:
                         type="primary",
                         use_container_width=True,
                     ):
-                        dt_now = _sheet_datetime_now()
-                        update_sheet_cells(
-                            group,
-                            C,
-                            {
-                                "DONE": TRUE_VAL,
-                                "MOVE": FALSE_VAL,
-                            },
-                        )
-                        write_report_datetime(group, C, dt_now)
-                        st.session_state.local_in_work.discard(oid_str)
-                        st.session_state.reviewed_changes.discard(rk)
-                        _log_action(oid_str, group, current_store, "done")
-                        save_state_to_sheets()
-                        st.rerun()
+                        _handle_complete_order(oid_str, group, review_key)
 
                     st.markdown("---")
                     if st.button("🚫 Отменить заказ", key=f"cancel_{oid_str}", use_container_width=True):
-                        update_sheet_cells(group, C, {"STATUS": CANCELLED_VAL})
-                        st.session_state.local_in_work.discard(oid_str)
-                        save_state_to_sheets()
-                        st.rerun()
+                        _handle_cancel_order(oid_str, group)
 
             else:
                 if st.button("В работу", key=f"w_{oid_str}", use_container_width=True):
-                    st.session_state.local_in_work.add(oid_str)
-                    save_state_to_sheets()
-                    st.rerun()
+                    _handle_mark_in_work(oid_str)
 
     col1, col2 = st.columns(2)
 
@@ -1007,7 +1020,7 @@ def render_store(current_store: str) -> None:
             _render_order(oid, group, in_work_section=True)
 
 
-# ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
+# ── РОУТИНГ ───────────────────────────────────────────────────────────────────
 if st.session_state.get(REPORT_PAGE_KEY):
     render_report()
     if st.sidebar.button("⬅️ Назад", use_container_width=True):
@@ -1019,7 +1032,7 @@ elif "Магазин" in menu:
 
 elif menu == "🚚 Перемещения (Активные)":
     st.title("🚚 В пути")
-    for oid, group in work_base[work_base[C_MOVE] == TRUE_VAL].groupby(C_ORDER, sort=False):
+    for oid, group in work_base[_bool_series_eq(work_base[C_MOVE], TRUE_VAL)].groupby(C_ORDER, sort=False):
         with st.expander(f"Перемещение №{oid} ⮕ {group['_target_store'].iloc[0]}"):
             render_order_table(group)
             if st.button("Сбросить статус перемещения", key=f"cl_mv_{oid}"):
@@ -1030,8 +1043,8 @@ elif menu == "⏳ Товар Под заказ":
     st.title("⏳ Ожидание поступления (ПЗ)")
     pz = work_base[
         work_base[C_WH].isin(PZ_LIST)
-        & (work_base[C_INWORK] != TRUE_VAL)
-        & (work_base[C_DONE] != TRUE_VAL)
+        & (_bool_series_eq(work_base[C_INWORK], TRUE_VAL) == False)
+        & (_bool_series_eq(work_base[C_DONE], TRUE_VAL) == False)
         & ~work_base["_is_cancelled"]
     ]
     st.dataframe(
@@ -1042,9 +1055,7 @@ elif menu == "⏳ Товар Под заказ":
 
 elif menu == "✅ Выполненные сборки":
     st.title("✅ Последние собранные")
-    done = work_base[
-        (work_base[C_DONE] == TRUE_VAL) & ~work_base["_is_cancelled"]
-    ].iloc[::-1].head(PREVIEW_ORDERS)
+    done = work_base[(_bool_series_eq(work_base[C_DONE], TRUE_VAL)) & ~work_base["_is_cancelled"]].iloc[::-1].head(PREVIEW_ORDERS)
     st.dataframe(
         done[TABLE_COLS].rename(columns=COL_RENAME),
         use_container_width=True,
