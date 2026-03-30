@@ -1,6 +1,7 @@
 """
 Авеню: Система Заказов
-v4.1 — безопасный рефакторинг без изменения UI/логики.
+v4.3 — безопасный рефакторинг без изменения UI/логики.
+Сверх-осторожная версия: точечные обновления только нужных ячеек, время записи по МСК.
 """
 
 from __future__ import annotations
@@ -9,8 +10,10 @@ import base64
 import hashlib
 import hmac
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import extra_streamlit_components as stx
 import gspread
@@ -19,25 +22,34 @@ import streamlit as st
 from google.oauth2.credentials import Credentials
 from streamlit_autorefresh import st_autorefresh
 
+
 # ── КОНСТАНТЫ ─────────────────────────────────────────────────────────────────
 SHEET_ID                = "15DIisQJVQqxcPIX08xaX4b7t3Rwfrzj2DV5DqkAWQeg"
 TAB_NAME                = "Заказы ИМ Авеню"
 STATE_TAB_NAME          = "avenue_state"
+
 PZ_LIST                 = frozenset(["ПЗ Пекин", "ПЗ Горбушка"])
 START_ROW               = 26596
+
 TRUE_VAL                = "TRUE"
 FALSE_VAL               = "FALSE"
+CANCELLED_VAL           = "Отменён"
+
 COOKIE_NAME             = "avenue_auth_status"
 COOKIE_DAYS             = 30
+
 REFRESH_MS              = 600_000
 PREVIEW_ORDERS          = 50
+STATE_SYNC_TTL          = 15
+
+REPORT_PAGE_KEY         = "report_page_open"
+REPORT_DATE_COL         = "Дата и время сбора заказа"
+
 STORE_GORB              = "Горбушка"
 STORE_PEKIN             = "Пекин"
 STORE_TIK               = "ТИК"
-CANCELLED_VAL           = "Отменён"
-STATE_SYNC_TTL          = 15
-REPORT_PAGE_KEY         = "report_page_open"
-REPORT_DATE_COL         = "Дата и время сбора заказа"
+
+MSK_TZ                  = ZoneInfo("Europe/Moscow")
 
 _PEKIN_KEYWORDS = ("пек", "пкн", "pekin")
 _GORB_KEYWORDS  = ("горб", "грб", "gorb")
@@ -53,13 +65,45 @@ MENU_OPTIONS = [
 
 STATE_HEADERS = ["local_in_work", "reviewed_changes", "confirmed_cancels", "completed_log"]
 
+
 # ── НАСТРОЙКА СТРАНИЦЫ ────────────────────────────────────────────────────────
 st.set_page_config(page_title="Авеню: Система Заказов", layout="wide")
 
-# ── УТИЛИТЫ ───────────────────────────────────────────────────────────────────
 
+# ── СТРУКТУРЫ ─────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class ColumnMap:
+    ORDER: int
+    PRODUCT: int
+    QTY: int
+    WH: int
+    COMMENT: int
+    EDIT: int
+    INWORK: int
+    MOVE: int
+    DONE: int
+    STATUS: int
+    REPORT_DT: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "ORDER": self.ORDER,
+            "PRODUCT": self.PRODUCT,
+            "QTY": self.QTY,
+            "WH": self.WH,
+            "COMMENT": self.COMMENT,
+            "EDIT": self.EDIT,
+            "INWORK": self.INWORK,
+            "MOVE": self.MOVE,
+            "DONE": self.DONE,
+            "STATUS": self.STATUS,
+            "REPORT_DT": self.REPORT_DT,
+        }
+
+
+# ── УТИЛИТЫ ───────────────────────────────────────────────────────────────────
 def _now() -> datetime:
-    return datetime.now()
+    return datetime.now(MSK_TZ)
 
 
 def _sheet_datetime_now() -> str:
@@ -86,6 +130,26 @@ def _get_secret(name: str, default: str | None = None) -> str:
         st.stop()
 
 
+def _ensure_row_width(row: list[str], width: int) -> list[str]:
+    if len(row) >= width:
+        return row[:width]
+    return row + [""] * (width - len(row))
+
+
+def _a1_col(col_num_1based: int) -> str:
+    result = ""
+    n = col_num_1based
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _review_key(oid: Any, edit_text: str) -> str:
+    return f"{_safe_str(oid)}||{_normalized_str(edit_text)}"
+
+
+# ── АВТОРИЗАЦИЯ ───────────────────────────────────────────────────────────────
 def _cookie_signing_key() -> str:
     raw = _get_secret("password")
     pepper = _get_secret("cookie_sign_salt", "avenue_cookie_default_salt")
@@ -129,13 +193,6 @@ def _verify_signed_cookie(token: str | None) -> bool:
         return False
 
 
-def _ensure_row_width(row: list[str], width: int) -> list[str]:
-    if len(row) >= width:
-        return row[:width]
-    return row + [""] * (width - len(row))
-
-
-# ── АВТОРИЗАЦИЯ ───────────────────────────────────────────────────────────────
 if "cookie_manager" not in st.session_state:
     st.session_state.cookie_manager = stx.CookieManager(key="avenue_auth_manager_v4")
 
@@ -179,8 +236,8 @@ def check_password() -> bool:
 if not check_password():
     st.stop()
 
-# ── GOOGLE SHEETS: РЕСУРСЫ ────────────────────────────────────────────────────
 
+# ── GOOGLE SHEETS: РЕСУРСЫ ────────────────────────────────────────────────────
 @st.cache_resource
 def get_gspread_client() -> gspread.Client:
     try:
@@ -240,7 +297,6 @@ def get_state_worksheet() -> gspread.Worksheet:
 
 
 # ── СОСТОЯНИЕ В GOOGLE SHEETS ─────────────────────────────────────────────────
-
 @st.cache_data(ttl=STATE_SYNC_TTL)
 def load_state_from_sheets() -> dict[str, Any]:
     try:
@@ -289,8 +345,8 @@ def save_state_to_sheets() -> None:
         rows += list(map(list, zip(pad(in_work), pad(reviewed), pad(confirmed), pad(log))))
 
         ws = get_state_worksheet()
-
         end_row = len(rows)
+
         ws.update(f"A1:D{end_row}", rows, value_input_option="RAW")
 
         existing_rows = ws.row_count
@@ -302,7 +358,53 @@ def save_state_to_sheets() -> None:
         st.warning(f"Не удалось сохранить состояние в Sheets: {e}")
 
 
+def _sync_runtime_state() -> None:
+    state = load_state_from_sheets()
+    st.session_state.local_in_work = set(_safe_str(x) for x in state["in_work"])
+    st.session_state.reviewed_changes = set(_safe_str(x) for x in state["reviewed"])
+    st.session_state.confirmed_cancels = set(_safe_str(x) for x in state["confirmed"])
+    st.session_state.completed_log = list(state["log"])
+
+
 # ── ЗАГРУЗКА ДАННЫХ ЗАКАЗОВ ───────────────────────────────────────────────────
+def _find_header_row(raw_data: list[list[str]]) -> int:
+    return next(
+        (
+            i for i, row in enumerate(raw_data[:100])
+            if "Наименование" in row and "Склад" in row
+        ),
+        -1,
+    )
+
+
+def _build_column_map(headers: list[str]) -> ColumnMap:
+    def col_idx(name: str) -> int:
+        try:
+            return headers.index(name)
+        except ValueError:
+            raise ValueError(f"Колонка «{name}» не найдена в таблице.")
+
+    status_idx = headers.index("Статус") if "Статус" in headers else len(headers) - 1
+
+    col_map = ColumnMap(
+        ORDER=col_idx("Наименование") - 1,
+        PRODUCT=col_idx("Наименование"),
+        QTY=col_idx("Кол-во"),
+        WH=col_idx("Склад"),
+        COMMENT=col_idx("Комментарий"),
+        EDIT=col_idx("Изменения заказа"),
+        INWORK=col_idx("Под ЗАКАЗ"),
+        MOVE=col_idx("Перемещение"),
+        DONE=col_idx("Собрано"),
+        STATUS=status_idx,
+        REPORT_DT=col_idx(REPORT_DATE_COL),
+    )
+
+    if col_map.ORDER < 0:
+        raise ValueError("Ошибка структуры таблицы: колонка заказа должна стоять перед «Наименование».")
+
+    return col_map
+
 
 @st.cache_data(ttl=3600)
 def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
@@ -320,46 +422,17 @@ def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
     if not raw_data:
         return pd.DataFrame(), {}
 
-    header_idx = next(
-        (
-            i for i, row in enumerate(raw_data[:100])
-            if "Наименование" in row and "Склад" in row
-        ),
-        -1,
-    )
+    header_idx = _find_header_row(raw_data)
     if header_idx == -1:
         return pd.DataFrame(), {}
 
     headers = [_safe_str(h).strip().replace("\n", " ") for h in raw_data[header_idx]]
     headers_len = len(headers)
 
-    def col_idx(name: str) -> int:
-        try:
-            return headers.index(name)
-        except ValueError:
-            raise ValueError(f"Колонка «{name}» не найдена в таблице.")
-
     try:
-        status_idx = headers.index("Статус") if "Статус" in headers else len(headers) - 1
-        col_map = {
-            "ORDER":     col_idx("Наименование") - 1,
-            "PRODUCT":   col_idx("Наименование"),
-            "QTY":       col_idx("Кол-во"),
-            "WH":        col_idx("Склад"),
-            "COMMENT":   col_idx("Комментарий"),
-            "EDIT":      col_idx("Изменения заказа"),
-            "INWORK":    col_idx("Под ЗАКАЗ"),
-            "MOVE":      col_idx("Перемещение"),
-            "DONE":      col_idx("Собрано"),
-            "STATUS":    status_idx,
-            "REPORT_DT": col_idx(REPORT_DATE_COL),
-        }
+        col_map = _build_column_map(headers)
     except ValueError as e:
         st.error(str(e))
-        return pd.DataFrame(), {}
-
-    if col_map["ORDER"] < 0:
-        st.error("Ошибка структуры таблицы: колонка заказа должна стоять перед «Наименование».")
         return pd.DataFrame(), {}
 
     data_start = max(START_ROW - 1, header_idx + 1)
@@ -371,46 +444,69 @@ def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
     df = pd.DataFrame(rows, columns=headers)
     df["_sheet_row"] = range(data_start + 1, data_start + 1 + len(df))
 
-    product_col = headers[col_map["PRODUCT"]]
+    product_col = headers[col_map.PRODUCT]
     df = df[df[product_col].fillna("").astype(str).str.strip().astype(bool)].copy()
 
     st.session_state.last_sync = _now().strftime("%H:%M:%S")
-    return df, col_map
+    return df, col_map.as_dict()
+
+
+# ── ТОЧЕЧНЫЕ ОБНОВЛЕНИЯ В SHEETS ──────────────────────────────────────────────
+def _build_batch_payload_for_rows(
+    row_numbers: list[int],
+    col_num_0based: int,
+    value: str,
+) -> list[dict[str, Any]]:
+    col_letter = _a1_col(col_num_0based + 1)
+    return [{"range": f"{col_letter}{row_num}", "values": [[value]]} for row_num in row_numbers]
 
 
 def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: dict[str, str]) -> None:
+    """
+    Аккуратно обновляет только целевые ячейки.
+    Не трогает другие диапазоны.
+    """
     try:
         sheet = get_orders_worksheet()
+        row_numbers = [int(x) for x in group["_sheet_row"].tolist()]
+        batch_payload: list[dict[str, Any]] = []
 
         for key, val in updates.items():
             if key not in col_map:
                 raise KeyError(f"Неизвестный ключ обновления: {key}")
 
-            col_num = int(col_map[key]) + 1
-            for row_num in group["_sheet_row"]:
-                sheet.update_cell(int(row_num), col_num, val)
+            col_num_0based = int(col_map[key])
+            batch_payload.extend(_build_batch_payload_for_rows(row_numbers, col_num_0based, val))
 
-        load_data.clear()
+        if batch_payload:
+            sheet.batch_update(batch_payload, value_input_option="RAW")
+            load_data.clear()
+
     except Exception as e:
         st.warning(f"Не удалось обновить данные в Sheets: {e}")
 
 
-def write_report_datetime(group: pd.DataFrame, dt_value: str) -> None:
+def write_report_datetime(group: pd.DataFrame, col_map: dict[str, int], dt_value: str) -> None:
+    """
+    Записывает дату/время строго в найденную по заголовку колонку отчёта.
+    Время всегда по МСК.
+    """
     try:
         sheet = get_orders_worksheet()
-        for row_num in group["_sheet_row"]:
-            sheet.update(f"R{int(row_num)}", [[dt_value]], value_input_option="USER_ENTERED")
-        load_data.clear()
+        row_numbers = [int(x) for x in group["_sheet_row"].tolist()]
+        report_col = int(col_map["REPORT_DT"])
+
+        batch_payload = _build_batch_payload_for_rows(row_numbers, report_col, dt_value)
+
+        if batch_payload:
+            sheet.batch_update(batch_payload, value_input_option="USER_ENTERED")
+            load_data.clear()
+
     except Exception as e:
         st.warning(f"Не удалось записать дату сборки: {e}")
 
 
 # ── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ───────────────────────────────────────────────────
-
-def _review_key(oid: Any, edit_text: str) -> str:
-    return f"{_safe_str(oid)}||{_normalized_str(edit_text)}"
-
-
 def identify_target_store(comment: str) -> str:
     c = _safe_str(comment).lower()
     if "d" in c:
@@ -463,14 +559,6 @@ def _log_action(oid: Any, group: pd.DataFrame, store: str, action: str) -> None:
 
 def render_order_table(group: pd.DataFrame) -> None:
     st.table(group[TABLE_COLS].rename(columns=COL_RENAME))
-
-
-def _sync_runtime_state() -> None:
-    state = load_state_from_sheets()
-    st.session_state.local_in_work = set(_safe_str(x) for x in state["in_work"])
-    st.session_state.reviewed_changes = set(_safe_str(x) for x in state["reviewed"])
-    st.session_state.confirmed_cancels = set(_safe_str(x) for x in state["confirmed"])
-    st.session_state.completed_log = list(state["log"])
 
 
 def _to_numeric_qty(series: pd.Series) -> pd.Series:
@@ -544,7 +632,7 @@ def render_report() -> None:
 
     st.caption(f"Отчёт строится по столбцу: **{REPORT_DATE_COL}**")
 
-    now_ts = pd.Timestamp(_now())
+    now_ts = pd.Timestamp(_now().replace(tzinfo=None))
     today_start = now_ts.normalize()
     tomorrow_start = today_start + pd.Timedelta(days=1)
 
@@ -591,6 +679,7 @@ refresh_count = (
     else 0
 )
 
+
 # ── ИНИЦИАЛИЗАЦИЯ СЕССИИ ──────────────────────────────────────────────────────
 if "session_initialized" not in st.session_state:
     _sync_runtime_state()
@@ -605,6 +694,7 @@ else:
 
 if refresh_count > 0:
     load_data.clear()
+
 
 # ── ЗАГРУЗКА И ПОДГОТОВКА ДАННЫХ ──────────────────────────────────────────────
 df_mem, C = load_data()
@@ -646,7 +736,6 @@ COL_RENAME = {
     C_COMMENT: "Коммент",
 }
 
-# Оповещения о новых заказах
 current_order_ids = set(df_mem[C_ORDER].dropna().astype(str).unique())
 if st.session_state.prev_order_ids:
     new_ids = current_order_ids - st.session_state.prev_order_ids
@@ -655,12 +744,12 @@ if st.session_state.prev_order_ids:
         st.session_state.new_orders_alert_time = _now()
 st.session_state.prev_order_ids = current_order_ids
 
-# Вычисляемые колонки
 work_base = df_mem.copy()
 work_base["_target_store"] = work_base[C_COMMENT].apply(identify_target_store)
 work_base["_is_cancelled"] = (
     work_base[C_STATUS].astype(str).str.strip().str.lower() == CANCELLED_VAL.lower()
 )
+
 
 # ── САЙДБАР ───────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Меню Авеню")
@@ -691,8 +780,8 @@ if st.sidebar.button("📊 Отчёт", use_container_width=True):
     st.session_state[REPORT_PAGE_KEY] = True
     st.rerun()
 
-# ── ЛОГИКА МАГАЗИНА ───────────────────────────────────────────────────────────
 
+# ── ЛОГИКА МАГАЗИНА ───────────────────────────────────────────────────────────
 def render_store(current_store: str) -> None:
     st.title(f"🏪 Заказы: {current_store}")
 
@@ -848,7 +937,7 @@ def render_store(current_store: str) -> None:
                                 "MOVE": FALSE_VAL,
                             },
                         )
-                        write_report_datetime(group, dt_now)
+                        write_report_datetime(group, C, dt_now)
                         st.session_state.local_in_work.discard(oid_str)
                         _log_action(oid_str, group, current_store, "done")
                         save_state_to_sheets()
@@ -883,7 +972,7 @@ def render_store(current_store: str) -> None:
                                 "MOVE": FALSE_VAL,
                             },
                         )
-                        write_report_datetime(group, dt_now)
+                        write_report_datetime(group, C, dt_now)
                         st.session_state.local_in_work.discard(oid_str)
                         st.session_state.reviewed_changes.discard(rk)
                         _log_action(oid_str, group, current_store, "done")
@@ -919,7 +1008,6 @@ def render_store(current_store: str) -> None:
 
 
 # ── МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────────────────────
-
 if st.session_state.get(REPORT_PAGE_KEY):
     render_report()
     if st.sidebar.button("⬅️ Назад", use_container_width=True):
