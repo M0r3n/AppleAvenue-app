@@ -1,7 +1,7 @@
 """
 Авеню: Система Заказов
-v4.3 — безопасный рефакторинг без изменения UI/логики.
-Сверх-осторожная версия: точечные обновления только нужных ячеек, время записи по МСК.
+v4.4 — безопасный рефакторинг без изменения UI/логики.
+Сверх-осторожная версия: точечные обновления только нужных ячеек, время записи по МСК без авто-конвертации Google Sheets.
 """
 
 from __future__ import annotations
@@ -489,7 +489,7 @@ def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: di
 def write_report_datetime(group: pd.DataFrame, col_map: dict[str, int], dt_value: str) -> None:
     """
     Записывает дату/время строго в найденную по заголовку колонку отчёта.
-    Время всегда по МСК.
+    Время всегда по МСК и сохраняется БЕЗ авто-конвертации Google Sheets.
     """
     try:
         sheet = get_orders_worksheet()
@@ -499,7 +499,7 @@ def write_report_datetime(group: pd.DataFrame, col_map: dict[str, int], dt_value
         batch_payload = _build_batch_payload_for_rows(row_numbers, report_col, dt_value)
 
         if batch_payload:
-            sheet.batch_update(batch_payload, value_input_option="USER_ENTERED")
+            sheet.batch_update(batch_payload, value_input_option="RAW")
             load_data.clear()
 
     except Exception as e:
