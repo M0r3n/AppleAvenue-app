@@ -79,6 +79,34 @@ REPORT_ITEM_HEADERS = [
     "row_type",
 ]
 
+REPORT_CATEGORY_ORDER = {
+    "iPhone": 1,
+    "iPad": 2,
+    "MacBook": 3,
+    "AirPods": 4,
+    "AppleWatch": 5,
+    "Прочее Apple": 6,
+    "Аксессуары": 7,
+    "Dyson": 8,
+    "Samsung": 9,
+    "Прочее": 10,
+}
+
+ACCESSORY_KEYWORDS = (
+    "чехол",
+    "накладка",
+    "держатель",
+    "стекло",
+    "кабель",
+    "блок",
+    "блок питания",
+    "сетевой адаптер",
+    "ремешок",
+    "браслет",
+    "зарядное устройство",
+    "зарядка",
+)
+
 REPORT_EXPORT_SHEET = "Отчёт"
 REPORT_META_SHEET = "Параметры"
 
@@ -759,6 +787,50 @@ def _to_numeric_qty(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce").fillna(0)
 
 
+def _product_text_variants(product_name: Any) -> tuple[str, str]:
+    raw = _safe_str(product_name).strip().lower()
+    compact = raw.replace(" ", "").replace("-", "").replace("_", "")
+    return raw, compact
+
+
+def _is_accessory_product(product_name: Any) -> bool:
+    raw, _ = _product_text_variants(product_name)
+    return any(keyword in raw for keyword in ACCESSORY_KEYWORDS)
+
+
+def _detect_product_category(product_name: Any) -> str:
+    raw, compact = _product_text_variants(product_name)
+
+    if _is_accessory_product(product_name):
+        return "Аксессуары"
+
+    if "iphone" in compact:
+        return "iPhone"
+
+    if "ipad" in compact:
+        return "iPad"
+
+    if "macbook" in compact:
+        return "MacBook"
+
+    if "airpods" in compact or "earpod" in compact:
+        return "AirPods"
+
+    if "applewatch" in compact or "apple watch" in raw:
+        return "AppleWatch"
+
+    if "dyson" in raw or "dyson" in compact:
+        return "Dyson"
+
+    if "samsung" in raw or "samsung" in compact:
+        return "Samsung"
+
+    if "apple" in raw or "apple" in compact:
+        return "Прочее Apple"
+
+    return "Прочее"
+
+
 def _prepare_sales_report_df(df: pd.DataFrame) -> pd.DataFrame:
     if REPORT_DATE_COL not in df.columns:
         return pd.DataFrame()
@@ -785,14 +857,25 @@ def _build_period_report(report_df: pd.DataFrame, start_dt: pd.Timestamp, end_dt
     period_df = report_df[(report_df["_dt"] >= start_dt) & (report_df["_dt"] < end_dt)].copy()
 
     if period_df.empty:
-        return pd.DataFrame(columns=["Товар", "Продано"])
+        return pd.DataFrame(columns=["Категория", "Товар", "Продано"])
+
+    period_df["Категория"] = period_df[C_PRODUCT].apply(_detect_product_category)
 
     result = (
-        period_df.groupby(C_PRODUCT, dropna=False)["_qty_num"]
+        period_df.groupby(["Категория", C_PRODUCT], dropna=False)["_qty_num"]
         .sum()
         .reset_index()
         .rename(columns={C_PRODUCT: "Товар", "_qty_num": "Продано"})
-        .sort_values(["Продано", "Товар"], ascending=[False, True])
+    )
+
+    result["_cat_order"] = result["Категория"].map(REPORT_CATEGORY_ORDER).fillna(999)
+
+    result = (
+        result.sort_values(
+            ["_cat_order", "Продано", "Товар"],
+            ascending=[True, False, True],
+        )
+        .drop(columns=["_cat_order"])
         .reset_index(drop=True)
     )
 
@@ -906,8 +989,9 @@ def _write_excel_bytes(report_df: pd.DataFrame, meta_df: pd.DataFrame) -> bytes:
 
         ws = writer.sheets[REPORT_EXPORT_SHEET]
         ws.freeze_panes = "A2"
-        ws.column_dimensions["A"].width = 60
-        ws.column_dimensions["B"].width = 14
+        ws.column_dimensions["A"].width = 22
+        ws.column_dimensions["B"].width = 60
+        ws.column_dimensions["C"].width = 14
 
         ws_meta = writer.sheets[REPORT_META_SHEET]
         ws_meta.column_dimensions["A"].width = 24
@@ -982,7 +1066,7 @@ def save_report_to_state_sheet(
                 idx,
                 _safe_str(row.Товар),
                 row.Продано,
-                "item",
+                _safe_str(row.Категория),
             ])
 
         if item_rows:
@@ -1064,9 +1148,19 @@ def load_report_items(report_id: str) -> pd.DataFrame:
 
 
 def build_saved_report_excel(report_meta: pd.Series, items_df: pd.DataFrame) -> bytes:
-    export_df = items_df[["product", "sold"]].rename(
+    export_df = items_df.copy()
+    export_df["Категория"] = export_df["row_type"].apply(
+        lambda x: _safe_str(x).strip() if _safe_str(x).strip() and _safe_str(x).strip().lower() != "item" else "Прочее"
+    )
+    export_df = export_df[["Категория", "product", "sold"]].rename(
         columns={"product": "Товар", "sold": "Продано"}
     )
+
+    export_df["_cat_order"] = export_df["Категория"].map(REPORT_CATEGORY_ORDER).fillna(999)
+    export_df = export_df.sort_values(
+        ["_cat_order", "Продано", "Товар"],
+        ascending=[True, False, True],
+    ).drop(columns=["_cat_order"]).reset_index(drop=True)
 
     try:
         start_dt = pd.to_datetime(_safe_str(report_meta.get("date_from", "")), dayfirst=True, errors="coerce")
@@ -1140,7 +1234,11 @@ def render_report() -> None:
 
     result_df = _build_period_report(report_df, start_dt, end_dt_exclusive)
     result_df = _apply_report_search(result_df, search_text)
-    result_df = result_df.sort_values(["Продано", "Товар"], ascending=[False, True]).reset_index(drop=True)
+    result_df["_cat_order"] = result_df["Категория"].map(REPORT_CATEGORY_ORDER).fillna(999)
+    result_df = result_df.sort_values(
+        ["_cat_order", "Продано", "Товар"],
+        ascending=[True, False, True],
+    ).drop(columns=["_cat_order"]).reset_index(drop=True)
 
     total_sold = result_df["Продано"].sum() if not result_df.empty else 0
     total_items = len(result_df)
@@ -1193,6 +1291,7 @@ def render_report() -> None:
             hide_index=True,
             height=650,
             column_config={
+                "Категория": st.column_config.TextColumn("Категория", width="medium"),
                 "Товар": st.column_config.TextColumn("Товар", width="large"),
                 "Продано": st.column_config.NumberColumn("Продано", format="%.3f"),
             },
@@ -1231,8 +1330,18 @@ def render_report() -> None:
         st.warning("Для выбранного отчёта не найдены строки товаров.")
         return
 
-    preview_df = items_df[["product", "sold"]].rename(columns={"product": "Товар", "sold": "Продано"})
-    preview_df = preview_df.sort_values(["Продано", "Товар"], ascending=[False, True]).reset_index(drop=True)
+    preview_df = items_df.copy()
+    preview_df["Категория"] = preview_df["row_type"].apply(
+        lambda x: _safe_str(x).strip() if _safe_str(x).strip() and _safe_str(x).strip().lower() != "item" else "Прочее"
+    )
+    preview_df = preview_df[["Категория", "product", "sold"]].rename(
+        columns={"product": "Товар", "sold": "Продано"}
+    )
+    preview_df["_cat_order"] = preview_df["Категория"].map(REPORT_CATEGORY_ORDER).fillna(999)
+    preview_df = preview_df.sort_values(
+        ["_cat_order", "Продано", "Товар"],
+        ascending=[True, False, True],
+    ).drop(columns=["_cat_order"]).reset_index(drop=True)
 
     st.dataframe(preview_df, use_container_width=True, hide_index=True, height=400)
 
