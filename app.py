@@ -607,6 +607,39 @@ def is_delivery(comment: str) -> bool:
     return "d" in _safe_str(comment).lower()
 
 
+def _comment_wants_gorb(comment: str) -> bool:
+    c = _safe_str(comment).lower()
+    return any(k in c for k in _GORB_KEYWORDS) or "самовывоз горб" in c
+
+
+def _comment_wants_pekin(comment: str) -> bool:
+    c = _safe_str(comment).lower()
+    return any(k in c for k in _PEKIN_KEYWORDS) or "самовывоз пекин" in c
+
+
+def _source_store_from_wh(wh: str) -> str:
+    w = _safe_str(wh).lower()
+    if "пекин" in w:
+        return STORE_PEKIN
+    if "горб" in w or "сток" in w:
+        return STORE_GORB
+    return ""
+
+
+def _is_pending_move_from_store(wh: str, comment: str, current_store: str) -> bool:
+    source_store = _source_store_from_wh(wh)
+    if source_store != current_store:
+        return False
+
+    if current_store == STORE_PEKIN:
+        return _comment_wants_gorb(comment)
+
+    if current_store == STORE_GORB:
+        return _comment_wants_pekin(comment)
+
+    return False
+
+
 def _build_tags(
     comment_str: str,
     is_move_needed: bool,
@@ -1289,15 +1322,6 @@ def render_store(current_store: str) -> None:
     wh_match = work_base[C_WH].str.contains(wh_pattern, case=False, na=False)
     wh_clean = work_base[C_WH].fillna("").astype(str).str.strip()
 
-    comment_lower = work_base[C_COMMENT].fillna("").astype(str).str.lower()
-
-    wants_gorb = comment_lower.apply(
-        lambda x: any(k in x for k in _GORB_KEYWORDS) or "самовывоз горб" in x
-    )
-    wants_pekin = comment_lower.apply(
-        lambda x: any(k in x for k in _PEKIN_KEYWORDS) or "самовывоз пекин" in x
-    )
-
     is_f_match = wh_match & ~is_pz_row
     is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & _bool_series_eq(work_base[C_INWORK], TRUE_VAL)
 
@@ -1313,18 +1337,12 @@ def render_store(current_store: str) -> None:
         ~is_move
         & ~is_pz_row
         & ~is_tik_pending
-        & (
-            (
-                (current_store == STORE_PEKIN)
-                & wh_clean.str.contains("Пекин", case=False, na=False)
-                & wants_gorb
-            )
-            |
-            (
-                (current_store == STORE_GORB)
-                & wh_clean.str.contains("Горб|Сток", case=False, na=False)
-                & wants_pekin
-            )
+        & pd.Series(
+            [
+                _is_pending_move_from_store(wh, comment, current_store)
+                for wh, comment in zip(work_base[C_WH], work_base[C_COMMENT])
+            ],
+            index=work_base.index,
         )
     )
 
@@ -1422,21 +1440,12 @@ def render_store(current_store: str) -> None:
         cancelled = bool(group["_is_cancelled"].iloc[0])
         tik_pending = bool(group["_is_tik_pending"].iloc[0])
 
-        source_wh = _safe_str(group[C_WH].iloc[0]).lower()
-        comment_lc = _safe_str(group[C_COMMENT].iloc[0]).lower()
-
-        source_is_pekin = "пекин" in source_wh
-        source_is_gorb = any(x in source_wh for x in ["горб", "сток"])
-
-        wants_gorb = any(k in comment_lc for k in _GORB_KEYWORDS) or "самовывоз горб" in comment_lc
-        wants_pekin = any(k in comment_lc for k in _PEKIN_KEYWORDS) or "самовывоз пекин" in comment_lc
-
         is_move_needed = (
             not incoming
-            and (
-                (current_store == STORE_PEKIN and source_is_pekin and wants_gorb)
-                or
-                (current_store == STORE_GORB and source_is_gorb and wants_pekin)
+            and _is_pending_move_from_store(
+                _safe_str(group[C_WH].iloc[0]),
+                _safe_str(group[C_COMMENT].iloc[0]),
+                current_store,
             )
         )
 
