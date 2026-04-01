@@ -1287,25 +1287,55 @@ def render_store(current_store: str) -> None:
     is_pz_row = work_base[C_WH].isin(PZ_LIST)
     is_move = _bool_series_eq(work_base[C_MOVE], TRUE_VAL)
     wh_match = work_base[C_WH].str.contains(wh_pattern, case=False, na=False)
+    wh_clean = work_base[C_WH].fillna("").astype(str).str.strip()
 
     is_f_match = wh_match & ~is_pz_row
     is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & _bool_series_eq(work_base[C_INWORK], TRUE_VAL)
+
+    # Уже отправленные перемещения показываем в магазине-получателе
     is_incoming = is_move & (work_base["_target_store"] == current_store)
+
+    # ТИК показываем в магазине-получателе
     is_tik_pending = (
-        (work_base[C_WH].str.strip() == STORE_TIK)
+        (wh_clean == STORE_TIK)
         & ~is_move
         & (work_base["_target_store"] == current_store)
+    )
+
+    # Новые неотправленные перемещения показываем в магазине-источнике
+    is_waiting_move_from_current_store = (
+        ~is_move
+        & ~is_pz_row
+        & ~is_tik_pending
+        & (
+            (
+                (current_store == STORE_PEKIN)
+                & wh_clean.str.contains("Пекин", case=False, na=False)
+                & (work_base["_target_store"] == STORE_GORB)
+            )
+            |
+            (
+                (current_store == STORE_GORB)
+                & wh_clean.str.contains("Горб|Сток", case=False, na=False)
+                & (work_base["_target_store"] == STORE_PEKIN)
+            )
+        )
     )
 
     confirmed_set = {str(x) for x in st.session_state.confirmed_cancels}
 
     is_cancelled_unconfirmed = (
         work_base["_is_cancelled"]
-        & (is_f_match | is_pz_match | is_incoming | is_tik_pending)
+        & (is_f_match | is_pz_match | is_incoming | is_tik_pending | is_waiting_move_from_current_store)
         & ~work_base[C_ORDER].astype(str).isin(confirmed_set)
     )
 
-    base_mask = ((is_f_match | is_pz_match) & ~is_move) | is_incoming | is_tik_pending
+    base_mask = (
+        ((is_f_match | is_pz_match) & ~is_move)
+        | is_incoming
+        | is_tik_pending
+        | is_waiting_move_from_current_store
+    )
 
     reviewed = st.session_state.reviewed_changes
     edit_series = work_base[C_EDIT].fillna("").astype(str).str.strip()
@@ -1384,9 +1414,22 @@ def render_store(current_store: str) -> None:
         edit_text = _safe_str(group[C_EDIT].iloc[0])
         review_key = _review_key(oid_str, edit_text)
         has_edit = bool(edit_text.strip()) and review_key not in reviewed
-        is_move_needed = target != current_store and target != "Общий" and not incoming
         cancelled = bool(group["_is_cancelled"].iloc[0])
         tik_pending = bool(group["_is_tik_pending"].iloc[0])
+
+        source_wh = _safe_str(group[C_WH].iloc[0]).lower()
+        source_is_pekin = "пекин" in source_wh
+        source_is_gorb = any(x in source_wh for x in ["горб", "сток"])
+
+        is_move_needed = (
+            not incoming
+            and target != "Общий"
+            and (
+                (current_store == STORE_PEKIN and source_is_pekin and target == STORE_GORB)
+                or
+                (current_store == STORE_GORB and source_is_gorb and target == STORE_PEKIN)
+            )
+        )
 
         tag_str = _build_tags(
             comment_str=comment_str,
