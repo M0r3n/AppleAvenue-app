@@ -606,20 +606,20 @@ def is_delivery(comment: str) -> bool:
 def _comment_wants_gorb(comment: str) -> bool:
     c = _safe_str(comment).lower()
     return (
-        any(k in c for k in _GORB_KEYWORDS)
-        or "горбушка" in c
-        or "самовывоз горб" in c
+        "самовывоз горб" in c
         or "самовывоз с горбушки" in c
         or "на горб" in c
+        or "горбушка" in c
+        or any(k in c for k in _GORB_KEYWORDS)
     )
 
 
 def _comment_wants_pekin(comment: str) -> bool:
     c = _safe_str(comment).lower()
     return (
-        any(k in c for k in _PEKIN_KEYWORDS)
-        or "самовывоз пекин" in c
+        "самовывоз пекин" in c
         or "на пекин" in c
+        or any(k in c for k in _PEKIN_KEYWORDS)
     )
 
 
@@ -627,14 +627,26 @@ def identify_target_store(comment: str, wh: str = "") -> str:
     c = _safe_str(comment).lower().strip()
     w = _safe_str(wh).lower().strip()
 
-    if _comment_wants_pekin(c):
+    # 1. Явное направление самовывоза — приоритет выше всего
+    if "самовывоз горб" in c or "самовывоз с горбушки" in c or "на горб" in c:
+        return STORE_GORB
+
+    if "самовывоз пекин" in c or "на пекин" in c:
         return STORE_PEKIN
+
+    # 2. Общие ключи. Горб выше Пекина, чтобы
+    # "самовывоз горб ... товар пекин" шёл в Горб
     if _comment_wants_gorb(c):
         return STORE_GORB
 
+    if _comment_wants_pekin(c):
+        return STORE_PEKIN
+
+    # 3. Доставка без явного магазина
     if is_delivery(c):
         return "Общий"
 
+    # 4. ТИК без явного назначения
     if w == STORE_TIK.lower():
         return "Общий"
 
