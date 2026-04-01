@@ -592,29 +592,53 @@ def write_report_datetime(group: pd.DataFrame, col_map: dict[str, int], dt_value
 
 
 # ── ПРЕДМЕТНАЯ ЛОГИКА ─────────────────────────────────────────────────────────
-def identify_target_store(comment: str) -> str:
-    c = _safe_str(comment).lower()
-    if "d" in c:
-        return STORE_GORB
-    if any(k in c for k in _PEKIN_KEYWORDS):
-        return STORE_PEKIN
-    if any(k in c for k in _GORB_KEYWORDS):
-        return STORE_GORB
-    return "Общий"
-
-
 def is_delivery(comment: str) -> bool:
-    return "d" in _safe_str(comment).lower()
+    c = _safe_str(comment).lower()
+    return (
+        "доставка" in c
+        or "курьер" in c
+        or "delivery" in c
+        or c.strip() == "d"
+        or " d " in f" {c} "
+    )
 
 
 def _comment_wants_gorb(comment: str) -> bool:
     c = _safe_str(comment).lower()
-    return any(k in c for k in _GORB_KEYWORDS) or "самовывоз горб" in c
+    return (
+        any(k in c for k in _GORB_KEYWORDS)
+        or "горбушка" in c
+        or "самовывоз горб" in c
+        or "самовывоз с горбушки" in c
+        or "на горб" in c
+    )
 
 
 def _comment_wants_pekin(comment: str) -> bool:
     c = _safe_str(comment).lower()
-    return any(k in c for k in _PEKIN_KEYWORDS) or "самовывоз пекин" in c
+    return (
+        any(k in c for k in _PEKIN_KEYWORDS)
+        or "самовывоз пекин" in c
+        or "на пекин" in c
+    )
+
+
+def identify_target_store(comment: str, wh: str = "") -> str:
+    c = _safe_str(comment).lower().strip()
+    w = _safe_str(wh).lower().strip()
+
+    if _comment_wants_pekin(c):
+        return STORE_PEKIN
+    if _comment_wants_gorb(c):
+        return STORE_GORB
+
+    if is_delivery(c):
+        return "Общий"
+
+    if w == STORE_TIK.lower():
+        return "Общий"
+
+    return "Общий"
 
 
 def _source_store_from_wh(wh: str) -> str:
@@ -1258,7 +1282,10 @@ if st.session_state.prev_order_ids:
 st.session_state.prev_order_ids = current_order_ids
 
 work_base = df_mem.copy()
-work_base["_target_store"] = work_base[C_COMMENT].apply(identify_target_store)
+work_base["_target_store"] = work_base.apply(
+    lambda row: identify_target_store(row[C_COMMENT], row[C_WH]),
+    axis=1,
+)
 work_base["_is_cancelled"] = (
     work_base[C_STATUS].astype(str).str.strip().str.lower() == CANCELLED_VAL.lower()
 )
