@@ -1510,6 +1510,21 @@ def render_store(current_store: str) -> None:
 
     is_incoming = is_move & (work_base["_target_store"] == current_store)
 
+    order_series = work_base[C_ORDER].astype(str)
+    in_work_ids = {str(x) for x in st.session_state.local_in_work}
+
+    is_outgoing_move_from_current_store = (
+        is_move
+        & pd.Series(
+            [
+                _source_store_from_wh(wh) == current_store
+                for wh in work_base[C_WH]
+            ],
+            index=work_base.index,
+        )
+        & (work_base["_target_store"] != current_store)
+    )
+
     is_tik_pending = (
         (wh_clean == STORE_TIK)
         & ~is_move
@@ -1531,9 +1546,33 @@ def render_store(current_store: str) -> None:
 
     confirmed_set = {str(x) for x in st.session_state.confirmed_cancels}
 
+    reviewed = st.session_state.reviewed_changes
+    edit_series = work_base[C_EDIT].fillna("").astype(str).str.strip()
+
+    review_keys = pd.Series(
+        (_review_key(oid, et) for oid, et in zip(order_series, edit_series)),
+        index=work_base.index,
+    )
+    has_unrev = edit_series.astype(bool) & ~review_keys.isin(reviewed)
+
+    is_outgoing_move_visible_here = (
+        is_outgoing_move_from_current_store
+        & (
+            order_series.isin(in_work_ids)
+            | has_unrev
+        )
+    )
+
     is_cancelled_unconfirmed = (
         work_base["_is_cancelled"]
-        & (is_f_match | is_pz_match | is_incoming | is_tik_pending | is_waiting_move_from_current_store)
+        & (
+            is_f_match
+            | is_pz_match
+            | is_incoming
+            | is_tik_pending
+            | is_waiting_move_from_current_store
+            | is_outgoing_move_visible_here
+        )
         & ~work_base[C_ORDER].astype(str).isin(confirmed_set)
     )
 
@@ -1542,17 +1581,8 @@ def render_store(current_store: str) -> None:
         | is_incoming
         | is_tik_pending
         | is_waiting_move_from_current_store
+        | is_outgoing_move_visible_here
     )
-
-    reviewed = st.session_state.reviewed_changes
-    edit_series = work_base[C_EDIT].fillna("").astype(str).str.strip()
-    order_series = work_base[C_ORDER].astype(str)
-
-    review_keys = pd.Series(
-        (_review_key(oid, et) for oid, et in zip(order_series, edit_series)),
-        index=work_base.index,
-    )
-    has_unrev = edit_series.astype(bool) & ~review_keys.isin(reviewed)
 
     not_confirmed_cancelled = ~(
         work_base["_is_cancelled"]
@@ -1564,8 +1594,6 @@ def render_store(current_store: str) -> None:
         | is_cancelled_unconfirmed
     ].copy()
     display_df["_is_tik_pending"] = is_tik_pending.reindex(display_df.index, fill_value=False)
-
-    in_work_ids = {str(x) for x in st.session_state.local_in_work}
 
     def _handle_mark_in_work(oid_str: str) -> None:
         st.session_state.local_in_work.add(oid_str)
@@ -1587,13 +1615,12 @@ def render_store(current_store: str) -> None:
 
     def _handle_send_move(oid_str: str, group: pd.DataFrame) -> None:
         update_sheet_cells(group, C, {"MOVE": TRUE_VAL})
-        st.session_state.local_in_work.discard(oid_str)
         save_state_to_sheets()
         st.rerun()
 
     def _handle_complete_order(oid_str: str, group: pd.DataFrame, review_key: str | None = None) -> None:
         dt_now = _sheet_datetime_now()
-        update_sheet_cells(group, C, {"DONE": TRUE_VAL, "MOVE": FALSE_VAL})
+        update_sheet_cells(group, C, {"DONE": TRUE_VAL})
         write_report_datetime(group, C, dt_now)
         st.session_state.local_in_work.discard(oid_str)
         if review_key:
