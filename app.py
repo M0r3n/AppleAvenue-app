@@ -1,17 +1,3 @@
-"""
-Авеню: Система Заказов
-v4.6 — безопасная чистка и оптимизация без изменения UI/логики.
-
-Что улучшено:
-- код структурирован по блокам;
-- убраны повторы;
-- добавлены более безопасные helper-функции;
-- обновления в Google Sheets по-прежнему точечные;
-- время записи по МСК сохраняется строкой без авто-конвертации Sheets;
-- сохранён текущий UI, сценарии и бизнес-логика;
-- повышена стабильность загрузки/sync/report/archive/export.
-"""
-
 from __future__ import annotations
 
 import base64
@@ -95,6 +81,8 @@ REPORT_ITEM_HEADERS = [
 
 REPORT_EXPORT_SHEET = "Отчёт"
 REPORT_META_SHEET = "Параметры"
+
+CHECKBOX_KEYS = {"INWORK", "MOVE", "DONE"}
 
 
 # ── НАСТРОЙКА СТРАНИЦЫ ────────────────────────────────────────────────────────
@@ -214,6 +202,15 @@ def _clear_all_runtime_caches() -> None:
     _clear_order_cache()
     _clear_state_cache()
     _clear_report_caches()
+
+
+def _sheet_value_for_cell(col_key: str, value: Any) -> Any:
+    if col_key in CHECKBOX_KEYS:
+        if value in (TRUE_VAL, True, "true", "True", 1):
+            return True
+        if value in (FALSE_VAL, False, "false", "False", 0):
+            return False
+    return value
 
 
 # ── COOKIE / АВТОРИЗАЦИЯ ──────────────────────────────────────────────────────
@@ -543,13 +540,16 @@ def load_data() -> tuple[pd.DataFrame, dict[str, int]]:
 def _build_batch_payload_for_rows(
     row_numbers: Iterable[int],
     col_num_0based: int,
-    value: str,
+    value: Any,
 ) -> list[dict[str, Any]]:
     col_letter = _a1_col(col_num_0based + 1)
-    return [{"range": f"{col_letter}{int(row_num)}", "values": [[value]]} for row_num in row_numbers]
+    return [
+        {"range": f"{col_letter}{int(row_num)}", "values": [[value]]}
+        for row_num in row_numbers
+    ]
 
 
-def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: dict[str, str]) -> None:
+def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: dict[str, Any]) -> None:
     try:
         sheet = get_orders_worksheet()
         row_numbers = [int(x) for x in group["_sheet_row"].tolist()]
@@ -558,10 +558,18 @@ def update_sheet_cells(group: pd.DataFrame, col_map: dict[str, int], updates: di
         for key, val in updates.items():
             if key not in col_map:
                 raise KeyError(f"Неизвестный ключ обновления: {key}")
-            batch_payload.extend(_build_batch_payload_for_rows(row_numbers, int(col_map[key]), val))
+
+            prepared_val = _sheet_value_for_cell(key, val)
+            batch_payload.extend(
+                _build_batch_payload_for_rows(
+                    row_numbers,
+                    int(col_map[key]),
+                    prepared_val,
+                )
+            )
 
         if batch_payload:
-            sheet.batch_update(batch_payload, value_input_option="RAW")
+            sheet.batch_update(batch_payload, value_input_option="USER_ENTERED")
             _clear_order_cache()
 
     except Exception as e:
