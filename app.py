@@ -591,6 +591,43 @@ def write_report_datetime(group: pd.DataFrame, col_map: dict[str, int], dt_value
         st.warning(f"Не удалось записать дату сборки: {e}")
 
 
+def backfill_report_datetime_for_manual_done(df: pd.DataFrame, col_map: dict[str, int]) -> bool:
+    """
+    Если галочка "Собрано" была выставлена вручную напрямую в Google Sheets,
+    а поле "Дата и время сбора заказа" пустое — дозаполняем его текущим временем.
+    Уже заполненные даты не трогаем.
+    """
+    try:
+        if REPORT_DATE_COL not in df.columns:
+            return False
+
+        report_col_name = df.columns[int(col_map["REPORT_DT"])]
+
+        done_mask = _bool_series_eq(df[C_DONE], TRUE_VAL)
+        report_dt_empty_mask = df[report_col_name].fillna("").astype(str).str.strip().eq("")
+
+        missing_dt_df = df[done_mask & report_dt_empty_mask].copy()
+        if missing_dt_df.empty:
+            return False
+
+        dt_now = _sheet_datetime_now()
+        sheet = get_orders_worksheet()
+        row_numbers = [int(x) for x in missing_dt_df["_sheet_row"].tolist()]
+        report_col = int(col_map["REPORT_DT"])
+
+        batch_payload = _build_batch_payload_for_rows(row_numbers, report_col, dt_now)
+        if batch_payload:
+            sheet.batch_update(batch_payload, value_input_option="RAW")
+            _clear_order_cache()
+            return True
+
+        return False
+
+    except Exception as e:
+        st.warning(f"Не удалось дозаполнить дату сборки для вручную отмеченных заказов: {e}")
+        return False
+
+
 # ── ПРЕДМЕТНАЯ ЛОГИКА ─────────────────────────────────────────────────────────
 def is_delivery(comment: str) -> bool:
     c = _safe_str(comment).lower()
@@ -627,26 +664,21 @@ def identify_target_store(comment: str, wh: str = "") -> str:
     c = _safe_str(comment).lower().strip()
     w = _safe_str(wh).lower().strip()
 
-    # 1. Явное направление самовывоза — приоритет выше всего
     if "самовывоз горб" in c or "самовывоз с горбушки" in c or "на горб" in c:
         return STORE_GORB
 
     if "самовывоз пекин" in c or "на пекин" in c:
         return STORE_PEKIN
 
-    # 2. Общие ключи. Горб выше Пекина, чтобы
-    # "самовывоз горб ... товар пекин" шёл в Горб
     if _comment_wants_gorb(c):
         return STORE_GORB
 
     if _comment_wants_pekin(c):
         return STORE_PEKIN
 
-    # 3. Доставка без явного магазина
     if is_delivery(c):
         return "Общий"
 
-    # 4. ТИК без явного назначения
     if w == STORE_TIK.lower():
         return "Общий"
 
@@ -1275,6 +1307,9 @@ df_mem[C_MOVE] = df_mem.iloc[:, C["MOVE"]].fillna("").astype(str)
 df_mem[C_STATUS] = df_mem.iloc[:, C["STATUS"]].fillna("").astype(str)
 df_mem[C_EDIT] = df_mem.iloc[:, C["EDIT"]].fillna("").astype(str)
 df_mem[C_INWORK] = df_mem.iloc[:, C["INWORK"]].fillna("").astype(str)
+
+if backfill_report_datetime_for_manual_done(df_mem, C):
+    st.rerun()
 
 TABLE_COLS = [C_ORDER, C_PRODUCT, C_QTY, C_WH, C_COMMENT]
 COL_RENAME = {
