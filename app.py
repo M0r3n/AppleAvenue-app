@@ -1615,6 +1615,7 @@ def render_store(current_store: str) -> None:
 
     def _handle_send_move(oid_str: str, group: pd.DataFrame) -> None:
         update_sheet_cells(group, C, {"MOVE": TRUE_VAL})
+        st.session_state.local_in_work.discard(oid_str)
         save_state_to_sheets()
         st.rerun()
 
