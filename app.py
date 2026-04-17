@@ -38,6 +38,7 @@ PREVIEW_ORDERS = 50
 STATE_SYNC_TTL = 15
 
 REPORT_PAGE_KEY = "report_page_open"
+MENU_STATE_KEY = "selected_menu"
 REPORT_DATE_COL = "Дата и время сбора заказа"
 
 STORE_GORB = "Горбушка"
@@ -1375,9 +1376,12 @@ def _init_session_state() -> None:
         st.session_state.new_orders_alert_time = None
         st.session_state.last_sync = "Не обновлялось"
         st.session_state[REPORT_PAGE_KEY] = False
+        st.session_state[MENU_STATE_KEY] = MENU_OPTIONS[0]
         st.session_state.session_initialized = True
     else:
         _sync_runtime_state()
+        if MENU_STATE_KEY not in st.session_state or st.session_state[MENU_STATE_KEY] not in MENU_OPTIONS:
+            st.session_state[MENU_STATE_KEY] = MENU_OPTIONS[0]
 
 
 _init_session_state()
@@ -1438,6 +1442,12 @@ if st.session_state.prev_order_ids:
 st.session_state.prev_order_ids = current_order_ids
 
 work_base = df_mem.copy()
+work_base["_order_str"] = work_base[C_ORDER].astype(str)
+work_base["_wh_clean"] = work_base[C_WH].fillna("").astype(str).str.strip()
+work_base["_is_done"] = _bool_series_eq(work_base[C_DONE], TRUE_VAL)
+work_base["_is_move"] = _bool_series_eq(work_base[C_MOVE], TRUE_VAL)
+work_base["_is_inwork"] = _bool_series_eq(work_base[C_INWORK], TRUE_VAL)
+
 work_base["_target_store"] = work_base.apply(
     lambda row: identify_target_store(row[C_COMMENT], row[C_WH]),
     axis=1,
@@ -1457,7 +1467,18 @@ def render_sidebar() -> str:
         key="auto_refresh_toggle",
     )
 
-    menu_value = st.sidebar.selectbox("Выберите раздел:", MENU_OPTIONS)
+    current_menu = st.session_state.get(MENU_STATE_KEY, MENU_OPTIONS[0])
+    if current_menu not in MENU_OPTIONS:
+        current_menu = MENU_OPTIONS[0]
+        st.session_state[MENU_STATE_KEY] = current_menu
+
+    menu_value = st.sidebar.selectbox(
+        "Выберите раздел:",
+        MENU_OPTIONS,
+        index=MENU_OPTIONS.index(current_menu),
+        key="sidebar_menu_select",
+    )
+    st.session_state[MENU_STATE_KEY] = menu_value
 
     if st.sidebar.button("🚪 Выйти"):
         cookie_manager.delete(COOKIE_NAME)
@@ -1501,16 +1522,16 @@ def render_store(current_store: str) -> None:
         st.success(f"🆕 Новые заказы: {', '.join(sorted(str(o) for o in store_new_alert))}")
 
     is_pz_row = work_base[C_WH].isin(PZ_LIST)
-    is_move = _bool_series_eq(work_base[C_MOVE], TRUE_VAL)
+    is_move = work_base["_is_move"]
     wh_match = work_base[C_WH].str.contains(wh_pattern, case=False, na=False)
-    wh_clean = work_base[C_WH].fillna("").astype(str).str.strip()
+    wh_clean = work_base["_wh_clean"]
 
     is_f_match = wh_match & ~is_pz_row
-    is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & _bool_series_eq(work_base[C_INWORK], TRUE_VAL)
+    is_pz_match = (work_base[C_WH] == f"ПЗ {current_store}") & work_base["_is_inwork"]
 
     is_incoming = is_move & (work_base["_target_store"] == current_store)
 
-    order_series = work_base[C_ORDER].astype(str)
+    order_series = work_base["_order_str"]
     in_work_ids = {str(x) for x in st.session_state.local_in_work}
 
     is_outgoing_move_from_current_store = (
@@ -1590,7 +1611,7 @@ def render_store(current_store: str) -> None:
     )
 
     display_df = work_base[
-        (base_mask & ((_bool_series_eq(work_base[C_DONE], TRUE_VAL) == False) | has_unrev) & not_confirmed_cancelled)
+        (base_mask & (~work_base["_is_done"] | has_unrev) & not_confirmed_cancelled)
         | is_cancelled_unconfirmed
     ].copy()
     display_df["_is_tik_pending"] = is_tik_pending.reindex(display_df.index, fill_value=False)
@@ -1784,8 +1805,8 @@ elif menu == "⏳ Товар Под заказ":
     st.title("⏳ Ожидание поступления (ПЗ)")
     pz = work_base[
         work_base[C_WH].isin(PZ_LIST)
-        & (_bool_series_eq(work_base[C_INWORK], TRUE_VAL) == False)
-        & (_bool_series_eq(work_base[C_DONE], TRUE_VAL) == False)
+        & (~work_base["_is_inwork"])
+        & (~work_base["_is_done"])
         & ~work_base["_is_cancelled"]
     ]
     st.dataframe(
@@ -1796,7 +1817,7 @@ elif menu == "⏳ Товар Под заказ":
 
 elif menu == "✅ Выполненные сборки":
     st.title("✅ Последние собранные")
-    done = work_base[(_bool_series_eq(work_base[C_DONE], TRUE_VAL)) & ~work_base["_is_cancelled"]].iloc[::-1].head(PREVIEW_ORDERS)
+    done = work_base[work_base["_is_done"] & ~work_base["_is_cancelled"]].iloc[::-1].head(PREVIEW_ORDERS)
     st.dataframe(
         done[TABLE_COLS].rename(columns=COL_RENAME),
         use_container_width=True,
